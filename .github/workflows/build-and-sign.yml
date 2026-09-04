@@ -1,4 +1,4 @@
-﻿name: Build and Sign ShakeLab
+name: Build and Sign ShakeLab
 
 on:
   push:
@@ -36,29 +36,32 @@ jobs:
           --collect-all cv2 `
           gui_app.py
 
-    - name: Buat ZIP distribusi
-      run: |
-        Compress-Archive -Path "dist\ShakeLab\*" -DestinationPath "ShakeLab-${{ github.ref_name }}-Windows.zip"
-
-    - name: Upload artifact untuk SignPath
+    - name: Upload unsigned EXE ke Artifacts
       id: upload-unsigned
       uses: actions/upload-artifact@v4
       with:
-        name: shakelab-unsigned
-        path: ShakeLab-${{ github.ref_name }}-Windows.zip
+        name: shakelab-unsigned-exe
+        path: dist/ShakeLab/ShakeLab.exe
 
-    # Aktifkan setelah mendapat API token dari SignPath Foundation
-    # - name: Tanda tangani dengan SignPath Foundation
-    #   uses: signpath/github-action-submit-signing-request@v1
-    #   with:
-    #     api-token: '${{ secrets.SIGNPATH_API_TOKEN }}'
-    #     organization-id: '${{ secrets.SIGNPATH_ORG_ID }}'
-    #     project-slug: 'shakelab'
-    #     signing-policy-slug: 'release-signing'
-    #     artifact-configuration-slug: 'shakelab-zip'
-    #     github-artifact-id: '${{ steps.upload-unsigned.outputs.artifact-id }}'
-    #     wait-for-completion: true
-    #     output-artifact-directory: signed-output
+    - name: Tanda tangani EXE dengan SignPath
+      uses: signpath/github-action-submit-signing-request@v1
+      with:
+        api-token: '${{ secrets.SIGNPATH_API_TOKEN }}'
+        organization-id: '${{ secrets.SIGNPATH_ORG_ID }}'
+        project-slug: 'ShakeLab'
+        signing-policy-slug: 'ShakeLab'
+        artifact-configuration-slug: 'initial-version'
+        github-artifact-id: '${{ steps.upload-unsigned.outputs.artifact-id }}'
+        wait-for-completion: true
+        output-artifact-directory: signed-output
+
+    - name: Ganti EXE asli dengan EXE yang telah ditandatangani
+      run: |
+        Copy-Item -Path "signed-output\ShakeLab.exe" -Destination "dist\ShakeLab\ShakeLab.exe" -Force
+
+    - name: Buat ZIP distribusi resmi
+      run: |
+        Compress-Archive -Path "dist\ShakeLab\*" -DestinationPath "ShakeLab-${{ github.ref_name }}-Windows.zip"
 
     - name: Buat GitHub Release
       uses: softprops/action-gh-release@v2
@@ -68,14 +71,12 @@ jobs:
         body: |
           ## ShakeLab ${{ github.ref_name }}
           
-          ### Cara Install:
-          1. Download file ZIP di bawah
-          2. Ekstrak ke folder mana saja
-          3. Jalankan ShakeLab.exe
+          Aplikasi resmi telah ditandatangani secara digital via SignPath.
           
-          ### Persyaratan Sistem:
-          - Windows 10/11 (64-bit)
-          - Tidak perlu install Python
+          ### Cara Menjalankan:
+          1. Unduh file `ShakeLab-${{ github.ref_name }}-Windows.zip` di bawah.
+          2. Ekstrak (Extract All) ke folder komputer Anda.
+          3. Jalankan `ShakeLab.exe`.
         draft: false
         prerelease: false
       env:
