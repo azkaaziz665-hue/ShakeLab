@@ -1,4 +1,4 @@
-name: Build and Sign ShakeLab
+name: Build and Release ShakeLab
 
 on:
   push:
@@ -36,47 +36,27 @@ jobs:
           --collect-all cv2 `
           gui_app.py
 
-    - name: Upload unsigned EXE ke Artifacts
-      id: upload-unsigned
-      uses: actions/upload-artifact@v4
-      with:
-        name: shakelab-unsigned-exe
-        path: dist/ShakeLab/ShakeLab.exe
-
-    - name: Tanda tangani EXE dengan SignPath
-      uses: signpath/github-action-submit-signing-request@v1
-      with:
-        api-token: '${{ secrets.SIGNPATH_API_TOKEN }}'
-        organization-id: '${{ secrets.SIGNPATH_ORG_ID }}'
-        project-slug: 'ShakeLab'
-        signing-policy-slug: 'ShakeLab'
-        artifact-configuration-slug: 'initial-version'
-        github-artifact-id: '${{ steps.upload-unsigned.outputs.artifact-id }}'
-        wait-for-completion: true
-        output-artifact-directory: signed-output
-
-    - name: Ganti EXE asli dengan EXE yang telah ditandatangani
-      run: |
-        Copy-Item -Path "signed-output\ShakeLab.exe" -Destination "dist\ShakeLab\ShakeLab.exe" -Force
-
-    - name: Buat ZIP distribusi resmi
+    - name: Buat ZIP distribusi aplikasi
       run: |
         Compress-Archive -Path "dist\ShakeLab\*" -DestinationPath "ShakeLab-${{ github.ref_name }}-Windows.zip"
 
-    - name: Buat GitHub Release
+    - name: Buat GitHub Release Otomatis
       uses: softprops/action-gh-release@v2
       with:
         files: ShakeLab-${{ github.ref_name }}-Windows.zip
         name: ShakeLab ${{ github.ref_name }}
         body: |
-          ## ShakeLab ${{ github.ref_name }}
+          ## 🏢 ShakeLab ${{ github.ref_name }}
+          Aplikasi Analisis Getaran Bangunan Miniatur untuk Uji Gempa.
           
-          Aplikasi resmi telah ditandatangani secara digital via SignPath.
+          ### 📥 Cara Menjalankan Aplikasi:
+          1. Unduh file **`ShakeLab-${{ github.ref_name }}-Windows.zip`** di bawah.
+          2. Klik kanan file `.zip` yang telah diunduh, lalu pilih **Extract All (Ekstrak Semua)**.
+          3. Buka folder hasil ekstrak, lalu klik ganda **`ShakeLab.exe`**.
           
-          ### Cara Menjalankan:
-          1. Unduh file `ShakeLab-${{ github.ref_name }}-Windows.zip` di bawah.
-          2. Ekstrak (Extract All) ke folder komputer Anda.
-          3. Jalankan `ShakeLab.exe`.
+          ---
+          > 💡 **Jika muncul jendela biru "Windows protected your PC":**
+          > Klik **More info (Info selengkapnya)** ➔ lalu klik tombol **Run anyway (Tetap jalankan)**.
         draft: false
         prerelease: false
       env:
