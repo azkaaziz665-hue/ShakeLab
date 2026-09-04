@@ -1,0 +1,82 @@
+﻿name: Build and Sign ShakeLab
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: windows-latest
+    
+    steps:
+    - name: Checkout kode
+      uses: actions/checkout@v4
+
+    - name: Setup Python 3.11
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install dependensi
+      run: |
+        python -m pip install --upgrade pip
+        pip install pyinstaller PyQt6 pyqtgraph openpyxl matplotlib opencv-contrib-python
+
+    - name: Build EXE dengan PyInstaller
+      run: |
+        python -m PyInstaller --noconfirm --onedir --windowed `
+          --name "ShakeLab" `
+          --icon "logo.ico" `
+          --add-data "logo.png;." `
+          --add-data "logo.ico;." `
+          --add-data "arrow_up.png;." `
+          --add-data "arrow_down.png;." `
+          --collect-all pyqtgraph `
+          --collect-all cv2 `
+          gui_app.py
+
+    - name: Buat ZIP distribusi
+      run: |
+        Compress-Archive -Path "dist\ShakeLab\*" -DestinationPath "ShakeLab-${{ github.ref_name }}-Windows.zip"
+
+    - name: Upload artifact untuk SignPath
+      id: upload-unsigned
+      uses: actions/upload-artifact@v4
+      with:
+        name: shakelab-unsigned
+        path: ShakeLab-${{ github.ref_name }}-Windows.zip
+
+    # Aktifkan setelah mendapat API token dari SignPath Foundation
+    # - name: Tanda tangani dengan SignPath Foundation
+    #   uses: signpath/github-action-submit-signing-request@v1
+    #   with:
+    #     api-token: '${{ secrets.SIGNPATH_API_TOKEN }}'
+    #     organization-id: '${{ secrets.SIGNPATH_ORG_ID }}'
+    #     project-slug: 'shakelab'
+    #     signing-policy-slug: 'release-signing'
+    #     artifact-configuration-slug: 'shakelab-zip'
+    #     github-artifact-id: '${{ steps.upload-unsigned.outputs.artifact-id }}'
+    #     wait-for-completion: true
+    #     output-artifact-directory: signed-output
+
+    - name: Buat GitHub Release
+      uses: softprops/action-gh-release@v2
+      with:
+        files: ShakeLab-${{ github.ref_name }}-Windows.zip
+        name: ShakeLab ${{ github.ref_name }}
+        body: |
+          ## ShakeLab ${{ github.ref_name }}
+          
+          ### Cara Install:
+          1. Download file ZIP di bawah
+          2. Ekstrak ke folder mana saja
+          3. Jalankan ShakeLab.exe
+          
+          ### Persyaratan Sistem:
+          - Windows 10/11 (64-bit)
+          - Tidak perlu install Python
+        draft: false
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

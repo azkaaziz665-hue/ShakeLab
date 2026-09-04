@@ -1,0 +1,32 @@
+﻿# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Build dan distribusi (dibuat ulang oleh GitHub Actions)
+build/
+dist/
+*.spec
+
+# Data hasil pengujian (jangan diupload ke publik)
+*.csv
+*.xlsx
+grafik_*.png
+tabel_*.txt
+data_*.csv
+data_*.xlsx
+
+# Sertifikat keamanan (RAHASIA - jangan pernah diupload!)
+*.pfx
+*.p12
+ShakeLab_CodeSign.*
+
+# File sementara
+*.log
+*.tmp
+.gitignore_temp
+
+# IDE
+.vscode/
+.idea/
