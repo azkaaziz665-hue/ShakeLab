@@ -149,14 +149,20 @@ def export_to_excel(filename, headers, units, rows):
 
 
 def get_marker_centers(corners, ids):
-    """Kembalikan dict {id: (cx, cy)} dari hasil deteksi."""
+    """Kembalikan dict {id: (cx, cy)} dan dict {id: size} dari hasil deteksi."""
     centers = {}
+    sizes = {}
     if ids is not None:
         for i, marker_id in enumerate(ids.flatten()):
             c = corners[i][0]
             cx, cy = float(c[:, 0].mean()), float(c[:, 1].mean())
             centers[int(marker_id)] = (cx, cy)
-    return centers
+            d01 = float(np.linalg.norm(c[0] - c[1]))
+            d12 = float(np.linalg.norm(c[1] - c[2]))
+            d23 = float(np.linalg.norm(c[2] - c[3]))
+            d30 = float(np.linalg.norm(c[3] - c[0]))
+            sizes[int(marker_id)] = (d01 + d12 + d23 + d30) / 4.0
+    return centers, sizes
 
 
 
@@ -200,16 +206,16 @@ def main():
 
     header_cols = [
         "timestamp_s", "frame",
-        f"ground_x_{unit_label}", f"ground_y_{unit_label}",
-        f"top_x_{unit_label}", f"top_y_{unit_label}",
-        f"disp_x_{unit_label}", f"disp_y_{unit_label}",
+        f"ground_x_{unit_label}", f"ground_y_{unit_label}", f"ground_z_{unit_label}",
+        f"top_x_{unit_label}", f"top_y_{unit_label}", f"top_z_{unit_label}",
+        f"disp_x_{unit_label}", f"disp_y_{unit_label}", f"disp_z_{unit_label}",
         "status"
     ]
     unit_cols = [
         "[s]", "[frame#]",
-        f"[{pos_unit}]", f"[{pos_unit}]",
-        f"[{pos_unit}]", f"[{pos_unit}]",
-        f"[{disp_unit}]", f"[{disp_unit}]",
+        f"[{pos_unit}]", f"[{pos_unit}]", f"[{pos_unit}]",
+        f"[{pos_unit}]", f"[{pos_unit}]", f"[{pos_unit}]",
+        f"[{disp_unit}]", f"[{disp_unit}]", f"[{disp_unit}]",
         "[-]"
     ]
 
@@ -237,25 +243,29 @@ def main():
     t_buffer = deque()
     x_buffer = deque()
     y_buffer = deque()
+    z_buffer = deque()
 
     # Buffer penuh — menyimpan SELURUH riwayat untuk grafik akhir & tabel
     t_all = []
     x_all = []
     y_all = []
+    z_all = []
     all_rows = []
 
     # State terakhir yang valid (untuk menutup gap deteksi singkat)
     last_ground, last_top = None, None
+    last_ground_size, last_top_size = None, None
     missing_count = 0
 
     # Setup plot live
     plt.ion()
-    fig, ax = plt.subplots(figsize=(8, 4))
+    fig, ax = plt.subplots(figsize=(9, 5))
     line_x, = ax.plot([], [], label=f"Displacement X ({unit_label})", color="crimson")
     line_y, = ax.plot([], [], label=f"Displacement Y ({unit_label})", color="royalblue")
+    line_z, = ax.plot([], [], label=f"Displacement Z ({unit_label})", color="darkorange")
     ax.set_xlabel("Waktu (s)")
     ax.set_ylabel(f"Displacement ({unit_label})")
-    ax.set_title("Respons Gedung Realtime - Uji Gempa")
+    ax.set_title("Respons Gedung Realtime (X, Y, Z) - Uji Gempa")
     ax.legend(loc="upper right")
     ax.grid(True, alpha=0.3)
 
@@ -275,10 +285,12 @@ def main():
             now = time.time() - t0
             corners, ids, _ = detector.detectMarkers(frame)
             cv2.aruco.drawDetectedMarkers(frame, corners, ids)
-            centers = get_marker_centers(corners, ids)
+            centers, sizes = get_marker_centers(corners, ids)
 
             ground_pos = centers.get(GROUND_MARKER_ID)
             top_pos = centers.get(TOP_MARKER_ID)
+            ground_size = sizes.get(GROUND_MARKER_ID)
+            top_size = sizes.get(TOP_MARKER_ID)
 
             status = "ok"
             if ground_pos is None or top_pos is None:
@@ -287,13 +299,17 @@ def main():
                 status = "interpolated" if missing_count <= MAX_MISSING_FRAMES else "missing"
                 ground_pos = ground_pos or last_ground
                 top_pos = top_pos or last_top
+                ground_size = ground_size or last_ground_size
+                top_size = top_size or last_top_size
             else:
                 missing_count = 0
 
             if ground_pos is not None:
                 last_ground = ground_pos
+                last_ground_size = ground_size
             if top_pos is not None:
                 last_top = top_pos
+                last_top_size = top_size
 
             if ground_pos and top_pos and status != "missing":
                 rel_x = top_pos[0] - ground_pos[0]
@@ -301,11 +317,12 @@ def main():
 
                 # Kumpulkan baseline dari frame-frame paling awal (kondisi diam)
                 if len(baseline_samples) < BASELINE_FRAMES:
-                    baseline_samples.append((rel_x, rel_y))
+                    baseline_samples.append((rel_x, rel_y, ground_size or 50.0, top_size or 50.0))
                     if len(baseline_samples) == BASELINE_FRAMES:
                         arr = np.array(baseline_samples)
                         baseline_rel = (arr[:, 0].mean(), arr[:, 1].mean())
-                        print(f"Baseline terkalibrasi: {baseline_rel}")
+                        baseline_sizes = (arr[:, 2].mean(), arr[:, 3].mean())
+                        print(f"Baseline terkalibrasi: XY={baseline_rel}, Sizes={baseline_sizes}")
 
                 if baseline_rel is not None:
                     disp_x = rel_x - baseline_rel[0]
@@ -321,10 +338,20 @@ def main():
                     g_y = ground_pos[1] * scale
                     t_x = top_pos[0] * scale
                     t_y = top_pos[1] * scale
+
+                    # Sumbu Z (Out-of-Plane)
+                    w_frame = frame.shape[1]
+                    focal_px = 0.85 * w_frame
+                    z_ref = focal_px * scale
+                    bg_s, bt_s = baseline_sizes if 'baseline_sizes' in locals() else (50.0, 50.0)
+                    g_z = z_ref * ((bg_s / max(ground_size or bg_s, 1e-3)) - 1.0)
+                    t_z = z_ref * ((bt_s / max(top_size or bt_s, 1e-3)) - 1.0)
+                    disp_z = t_z - g_z
+
                     row_data = [f"{now:.4f}", frame_idx,
-                                f"{g_x:.3f}", f"{g_y:.3f}",
-                                f"{t_x:.3f}", f"{t_y:.3f}",
-                                f"{disp_x:.3f}", f"{disp_y:.3f}", status]
+                                f"{g_x:.3f}", f"{g_y:.3f}", f"{g_z:.3f}",
+                                f"{t_x:.3f}", f"{t_y:.3f}", f"{t_z:.3f}",
+                                f"{disp_x:.3f}", f"{disp_y:.3f}", f"{disp_z:.3f}", status]
                     writer.writerow(row_data)
                     all_rows.append(row_data)
 
@@ -332,21 +359,24 @@ def main():
                     t_buffer.append(now)
                     x_buffer.append(disp_x)
                     y_buffer.append(disp_y)
+                    z_buffer.append(disp_z)
                     while t_buffer and now - t_buffer[0] > PLOT_WINDOW_SEC:
                         t_buffer.popleft()
                         x_buffer.popleft()
                         y_buffer.popleft()
+                        z_buffer.popleft()
 
                     # Simpan ke buffer penuh
                     t_all.append(now)
                     x_all.append(disp_x)
                     y_all.append(disp_y)
+                    z_all.append(disp_z)
 
                     # Overlay info di video
                     cv2.line(frame, (int(ground_pos[0]), int(ground_pos[1])),
                               (int(top_pos[0]), int(top_pos[1])), (0, 255, 255), 2)
-                    cv2.putText(frame, f"Disp X: {disp_x:.2f}{unit_label}  Y: {disp_y:.2f}{unit_label}",
-                                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                    cv2.putText(frame, f"dX:{disp_x:+.2f} dY:{disp_y:+.2f} dZ:{disp_z:+.2f}{unit_label}",
+                                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 2)
                 else:
                     cv2.putText(frame, "Mengkalibrasi baseline... jangan digoyang dulu",
                                 (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
@@ -358,6 +388,7 @@ def main():
             if frame_idx % 3 == 0 and len(t_buffer) > 1:
                 line_x.set_data(t_buffer, x_buffer)
                 line_y.set_data(t_buffer, y_buffer)
+                line_z.set_data(t_buffer, z_buffer)
                 ax.set_xlim(max(0, now - PLOT_WINDOW_SEC), max(now, PLOT_WINDOW_SEC))
                 ax.relim()
                 ax.autoscale_view(scalex=False)
@@ -380,9 +411,9 @@ def main():
         if all_rows:
             headers = [
                 "Waktu (s)", "Frame#",
-                f"Ground X ({unit_label})", f"Ground Y ({unit_label})",
-                f"Top X ({unit_label})", f"Top Y ({unit_label})",
-                f"Disp X ({unit_label})", f"Disp Y ({unit_label})",
+                f"Ground X ({unit_label})", f"Ground Y ({unit_label})", f"Ground Z ({unit_label})",
+                f"Top X ({unit_label})", f"Top Y ({unit_label})", f"Top Z ({unit_label})",
+                f"Disp X ({unit_label})", f"Disp Y ({unit_label})", f"Disp Z ({unit_label})",
                 "Status"
             ]
             col_widths = [len(h) for h in headers]
@@ -409,8 +440,8 @@ def main():
 
         # ── Simpan grafik hasil simulasi ke file PNG ──────────────────────
         if len(t_all) > 1:
-            fig_save, ax_save = plt.subplots(2, 1, figsize=(12, 7), sharex=True)
-            fig_save.suptitle("Hasil Simulasi Uji Gempa — Displacement Marker",
+            fig_save, ax_save = plt.subplots(3, 1, figsize=(12, 9), sharex=True)
+            fig_save.suptitle("Hasil Simulasi Uji Gempa — Displacement Marker (X, Y, Z)",
                               fontsize=14, fontweight="bold")
 
             ax_save[0].plot(t_all, x_all, color="crimson", linewidth=0.8)
@@ -420,12 +451,17 @@ def main():
 
             ax_save[1].plot(t_all, y_all, color="royalblue", linewidth=0.8)
             ax_save[1].set_ylabel(f"Displacement Y ({unit_label})")
-            ax_save[1].set_xlabel("Waktu (s)")
             ax_save[1].grid(True, alpha=0.3)
             ax_save[1].axhline(0, color="gray", linewidth=0.6, linestyle="--")
 
+            ax_save[2].plot(t_all, z_all, color="darkorange", linewidth=0.8)
+            ax_save[2].set_ylabel(f"Displacement Z ({unit_label})")
+            ax_save[2].set_xlabel("Waktu (s)")
+            ax_save[2].grid(True, alpha=0.3)
+            ax_save[2].axhline(0, color="gray", linewidth=0.6, linestyle="--")
+
             # Anotasi statistik ringkas di tiap subplot
-            for ax_s, vals, lbl in zip(ax_save, [x_all, y_all], ["X", "Y"]):
+            for ax_s, vals, lbl in zip(ax_save, [x_all, y_all, z_all], ["X", "Y", "Z"]):
                 arr = np.array(vals)
                 txt = (f"max={arr.max():.2f}  min={arr.min():.2f}  "
                        f"RMS={np.sqrt(np.mean(arr**2)):.2f} {unit_label}")
