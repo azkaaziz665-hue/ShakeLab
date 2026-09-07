@@ -502,18 +502,22 @@ def save_txt_table(filename, headers, rows, pixel_to_mm, frame_count):
         return False
 
 
-def save_png_plot(filename, t_all, x_all, y_all, unit_label):
-    """Menyimpan grafik plot pergeseran gedung ke gambar PNG resolusi tinggi secara thread-safe."""
+def save_png_plot(filename, t_all, x_all, y_all, z_all, unit_label):
+    """Menyimpan grafik plot pergeseran gedung ke gambar PNG resolusi tinggi secara thread-safe (3 Sumbu: X, Y, Z)."""
     if len(t_all) < 2:
         return False
     try:
-        fig = Figure(figsize=(11, 6))
+        fig = Figure(figsize=(11, 8))
         canvas = FigureCanvasAgg(fig)
         fig.patch.set_facecolor('#ffffff')
-        fig.suptitle("ShakeLab — Dynamic Lateral & Axial Response",
+        fig.suptitle("ShakeLab — Dynamic 3D Structural Response (Lateral, Axial & Out-of-Plane)",
                      fontsize=13, fontweight="bold", color="#0f172a")
 
-        ax = fig.subplots(2, 1, sharex=True)
+        # Jika data z_all kosong atau panjangnya tidak sama, buat array nol
+        if not z_all or len(z_all) != len(t_all):
+            z_all = [0.0] * len(t_all)
+
+        ax = fig.subplots(3, 1, sharex=True)
         for a in ax:
             a.set_facecolor('#f8fafc')
             a.grid(True, color='#e2e8f0', linestyle='--', alpha=0.8)
@@ -521,18 +525,31 @@ def save_png_plot(filename, t_all, x_all, y_all, unit_label):
             for spine in a.spines.values():
                 spine.set_color('#cbd5e1')
 
+        # Sumbu X
         ax[0].plot(t_all, x_all, color="#0284c7", linewidth=1.5, label="ΔX (Lateral Sway)")
         ax[0].set_ylabel(f"ΔX ({unit_label})", color='#0284c7', fontweight='bold')
         ax[0].axhline(0, color="#0284c7", linewidth=0.8, linestyle="--", alpha=0.5)
 
+        # Sumbu Y
         ax[1].plot(t_all, y_all, color="#9333ea", linewidth=1.5, label="ΔY (Axial Drop)")
         ax[1].set_ylabel(f"ΔY ({unit_label})", color='#9333ea', fontweight='bold')
-        ax[1].set_xlabel("Waktu (detik)", color='#0f172a')
         ax[1].axhline(0, color="#9333ea", linewidth=0.8, linestyle="--", alpha=0.5)
 
-        for ax_s, vals, c in zip(ax, [x_all, y_all], ['#0284c7', '#9333ea']):
+        # Sumbu Z
+        ax[2].plot(t_all, z_all, color="#ea580c", linewidth=1.5, label="ΔZ (Out-of-Plane)")
+        ax[2].set_ylabel(f"ΔZ ({unit_label})", color='#ea580c', fontweight='bold')
+        ax[2].set_xlabel("Waktu (detik)", color='#0f172a')
+        ax[2].axhline(0, color="#ea580c", linewidth=0.8, linestyle="--", alpha=0.5)
+
+        series_data = [
+            (ax[0], x_all, '#0284c7', 'ΔX Lateral'),
+            (ax[1], y_all, '#9333ea', 'ΔY Axial'),
+            (ax[2], z_all, '#ea580c', 'ΔZ Out-of-Plane')
+        ]
+
+        for ax_s, vals, c, name in series_data:
             arr = np.array(vals)
-            txt = f"Max: {arr.max():+.2f} | Min: {arr.min():+.2f} | RMS: {np.sqrt(np.mean(arr**2)):.2f} {unit_label}"
+            txt = f"{name} | Max: {arr.max():+.2f} | Min: {arr.min():+.2f} | RMS: {np.sqrt(np.mean(arr**2)):.2f} {unit_label}"
             ax_s.annotate(txt, xy=(0.02, 0.90), xycoords="axes fraction",
                           fontsize=8.5, va="top", color=c,
                           bbox=dict(boxstyle="round,pad=0.3", fc="#ffffff", ec="#cbd5e1", alpha=0.95))
@@ -613,6 +630,7 @@ class CalibrationCanvas(QWidget):
         super().paintEvent(event)
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
 
         painter.fillRect(self.rect(), QColor("#070e1d"))
 
@@ -799,9 +817,9 @@ def enumerate_cameras():
 # THREAD PEMROSES VIDEO & ARUCO (WORKER THREAD)
 # =====================================================================
 class VideoWorker(QThread):
-    """Thread pemrosesan video kamera & deteksi ArUco secara realtime."""
+    """Thread pemrosesan video kamera & deteksi ArUco secara realtime (X, Y, Z)."""
     frameReady = pyqtSignal(QImage, np.ndarray, int, float)  # q_img, raw_frame, frame_idx, fps
-    newDataPoint = pyqtSignal(float, int, float, float, str, bool, bool)  # t, idx, dx, dy, status, g_ok, t_ok
+    newDataPoint = pyqtSignal(float, int, float, float, float, str, bool, bool)  # t, idx, dx, dy, dz, status, g_ok, t_ok
     baselineStatus = pyqtSignal(int, int)  # current, total
     connectionChanged = pyqtSignal(bool, str)
     testFinished = pyqtSignal(dict)
@@ -814,6 +832,7 @@ class VideoWorker(QThread):
         
         self.camera_source = 0
         self.use_dshow = True
+        self.resolution_str = ""
 
         self.ground_id = 0
         self.top_id = 1
@@ -823,10 +842,12 @@ class VideoWorker(QThread):
 
         self.baseline_samples = []
         self.baseline_rel = None
+        self.baseline_sizes = None
         self.all_rows = []
         self.t_all = []
         self.x_all = []
         self.y_all = []
+        self.z_all = []
         self.frame_idx = 0
         self.t0 = 0.0
 
@@ -844,10 +865,12 @@ class VideoWorker(QThread):
         self.recording = True
         self.baseline_samples = []
         self.baseline_rel = None
+        self.baseline_sizes = None
         self.all_rows = []
         self.t_all = []
         self.x_all = []
         self.y_all = []
+        self.z_all = []
         self.frame_idx = 0
         self.t0 = time.time()
 
@@ -859,6 +882,7 @@ class VideoWorker(QThread):
                 "t_all": list(self.t_all),
                 "x_all": list(self.x_all),
                 "y_all": list(self.y_all),
+                "z_all": list(self.z_all),
                 "all_rows": [list(r) for r in self.all_rows],
                 "pixel_to_mm": self.pixel_to_mm
             }
@@ -869,6 +893,7 @@ class VideoWorker(QThread):
                 "t_all": [],
                 "x_all": [],
                 "y_all": [],
+                "z_all": [],
                 "all_rows": [],
                 "pixel_to_mm": self.pixel_to_mm
             }
@@ -882,13 +907,22 @@ class VideoWorker(QThread):
     def run(self):
         self.running = True
 
-        if self.use_dshow and isinstance(self.camera_source, int):
-            cap = cv2.VideoCapture(self.camera_source, cv2.CAP_DSHOW)
-        else:
+        if isinstance(self.camera_source, str):
+            # Optimasi FFmpeg low-latency untuk stream IP Camera via jaringan
+            import os
+            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "nobuffer;max_delay=500000"
             cap = cv2.VideoCapture(self.camera_source)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        else:
+            if self.use_dshow:
+                cap = cv2.VideoCapture(self.camera_source, cv2.CAP_DSHOW)
+            else:
+                cap = cv2.VideoCapture(self.camera_source)
 
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+            # Prioritaskan Full HD (1920x1080) untuk webcam / virtual cam (Iriun, DroidCam, USB HD)
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
         if not cap.isOpened():
             if isinstance(self.camera_source, str):
@@ -932,7 +966,9 @@ class VideoWorker(QThread):
             self.running = False
             return
 
-        self.connectionChanged.emit(True, "Kamera berhasil terhubung")
+        h_act, w_act = test_frame.shape[:2]
+        self.resolution_str = f"{w_act}x{h_act}"
+        self.connectionChanged.emit(True, f"Kamera berhasil terhubung ({self.resolution_str})")
 
         aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
         aruco_params = cv2.aruco.DetectorParameters()
@@ -940,6 +976,8 @@ class VideoWorker(QThread):
 
         last_ground = None
         last_top = None
+        last_ground_size = None
+        last_top_size = None
         missing_count = 0
 
         fps_timer = time.time()
@@ -966,14 +1004,22 @@ class VideoWorker(QThread):
             cv2.aruco.drawDetectedMarkers(frame, corners, ids)
 
             centers = {}
+            sizes = {}
             if ids is not None:
                 for i, marker_id in enumerate(ids.flatten()):
                     c = corners[i][0]
                     cx, cy = float(c[:, 0].mean()), float(c[:, 1].mean())
                     centers[int(marker_id)] = (cx, cy)
+                    d01 = float(np.linalg.norm(c[0] - c[1]))
+                    d12 = float(np.linalg.norm(c[1] - c[2]))
+                    d23 = float(np.linalg.norm(c[2] - c[3]))
+                    d30 = float(np.linalg.norm(c[3] - c[0]))
+                    sizes[int(marker_id)] = (d01 + d12 + d23 + d30) / 4.0
 
             ground_pos = centers.get(self.ground_id)
             top_pos = centers.get(self.top_id)
+            ground_size = sizes.get(self.ground_id)
+            top_size = sizes.get(self.top_id)
 
             g_detected = ground_pos is not None
             t_detected = top_pos is not None
@@ -984,13 +1030,17 @@ class VideoWorker(QThread):
                 status = "interpolated" if missing_count <= self.max_missing_frames else "missing"
                 ground_pos = ground_pos or last_ground
                 top_pos = top_pos or last_top
+                ground_size = ground_size or last_ground_size
+                top_size = top_size or last_top_size
             else:
                 missing_count = 0
 
             if ground_pos is not None:
                 last_ground = ground_pos
+                last_ground_size = ground_size
             if top_pos is not None:
                 last_top = top_pos
+                last_top_size = top_size
 
             # Anotasi visual modern command center pada frame kamera
             if ground_pos and top_pos and status != "missing":
@@ -1018,11 +1068,12 @@ class VideoWorker(QThread):
                     rel_y = top_pos[1] - ground_pos[1]
 
                     if len(self.baseline_samples) < self.baseline_frames_target:
-                        self.baseline_samples.append((rel_x, rel_y))
+                        self.baseline_samples.append((rel_x, rel_y, ground_size or 50.0, top_size or 50.0))
                         self.baselineStatus.emit(len(self.baseline_samples), self.baseline_frames_target)
                         if len(self.baseline_samples) == self.baseline_frames_target:
                             arr = np.array(self.baseline_samples)
                             self.baseline_rel = (arr[:, 0].mean(), arr[:, 1].mean())
+                            self.baseline_sizes = (arr[:, 2].mean(), arr[:, 3].mean())
 
                         cv2.putText(frame, f"TARE BASELINE: {len(self.baseline_samples)}/{self.baseline_frames_target} - Diamkan gedung",
                                     (15, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 165, 255), 2)
@@ -1041,26 +1092,36 @@ class VideoWorker(QThread):
                         t_x = top_pos[0] * scale
                         t_y = top_pos[1] * scale
 
+                        # Estimasi kedalaman Out-of-Plane (Sumbu Z)
+                        # Model optik perspektif: Z ~ f * W / size
+                        focal_px = 0.85 * w_act if w_act else 1000.0
+                        z_ref = focal_px * scale
+                        bg_s, bt_s = getattr(self, 'baseline_sizes', (50.0, 50.0))
+                        g_z = z_ref * ((bg_s / max(ground_size or bg_s, 1e-3)) - 1.0)
+                        t_z = z_ref * ((bt_s / max(top_size or bt_s, 1e-3)) - 1.0)
+                        disp_z = t_z - g_z
+
                         row_data = [f"{now:.4f}", self.frame_idx,
-                                    f"{g_x:.3f}", f"{g_y:.3f}",
-                                    f"{t_x:.3f}", f"{t_y:.3f}",
-                                    f"{disp_x:.3f}", f"{disp_y:.3f}", status]
+                                    f"{g_x:.3f}", f"{g_y:.3f}", f"{g_z:.3f}",
+                                    f"{t_x:.3f}", f"{t_y:.3f}", f"{t_z:.3f}",
+                                    f"{disp_x:.3f}", f"{disp_y:.3f}", f"{disp_z:.3f}", status]
                         self.all_rows.append(row_data)
                         self.t_all.append(now)
                         self.x_all.append(disp_x)
                         self.y_all.append(disp_y)
+                        self.z_all.append(disp_z)
 
-                        self.newDataPoint.emit(now, self.frame_idx, disp_x, disp_y, status, g_detected, t_detected)
+                        self.newDataPoint.emit(now, self.frame_idx, disp_x, disp_y, disp_z, status, g_detected, t_detected)
 
-                        # Tag callout Top Marker dengan nilai live delta X
+                        # Tag callout Top Marker dengan nilai live delta X & Z
                         tx, ty = int(top_pos[0]), int(top_pos[1])
-                        cv2.rectangle(frame, (tx + 12, ty - 14), (tx + 175, ty + 12), (29, 14, 7), -1)
-                        cv2.rectangle(frame, (tx + 12, ty - 14), (tx + 175, ty + 12), (252, 132, 192), 1)
-                        cv2.putText(frame, f"TOP #{self.top_id}: dX {disp_x:+.2f}mm", (tx + 16, ty + 4),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (252, 132, 192), 1)
+                        cv2.rectangle(frame, (tx + 12, ty - 14), (tx + 195, ty + 12), (29, 14, 7), -1)
+                        cv2.rectangle(frame, (tx + 12, ty - 14), (tx + 195, ty + 12), (252, 132, 192), 1)
+                        cv2.putText(frame, f"TOP #{self.top_id}: dX {disp_x:+.2f} | dZ {disp_z:+.2f}", (tx + 16, ty + 4),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (252, 132, 192), 1)
 
-                        cv2.putText(frame, f"ACTIVE RUN: dX {disp_x:+.2f} mm | dY {disp_y:+.2f} mm",
-                                    (15, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (52, 211, 153), 2)
+                        cv2.putText(frame, f"ACTIVE RUN: dX {disp_x:+.2f} mm | dY {disp_y:+.2f} mm | dZ {disp_z:+.2f} mm",
+                                    (15, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (52, 211, 153), 2)
                 else:
                     cv2.putText(frame, "PERINGATAN: Target Marker Hilang!",
                                 (15, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
@@ -1076,7 +1137,8 @@ class VideoWorker(QThread):
             q_img = QImage(rgb_frame.data, w, h, bytes_per_line, QImage.Format.Format_RGB888).copy()
             self.frameReady.emit(q_img, raw_frame_copy, self.frame_idx, current_fps)
 
-            time.sleep(0.015)
+            # Jeda minimal non-blocking untuk yield thread tanpa menumpuk buffer video
+            time.sleep(0.001)
 
         try:
             cap.release()
@@ -1111,14 +1173,18 @@ class MainWindow(QMainWindow):
         self.time_buffer = deque()
         self.x_buffer = deque()
         self.y_buffer = deque()
+        self.z_buffer = deque()
 
         # Statistik sementara
         self.max_x = 0.0
         self.min_x = 0.0
         self.max_y = 0.0
         self.min_y = 0.0
+        self.max_z = 0.0
+        self.min_z = 0.0
         self.sum_sq_x = 0.0
         self.sum_sq_y = 0.0
+        self.sum_sq_z = 0.0
         self.count_samples = 0
         self.total_frames_seen = 0
         self.locked_frames_count = 0
@@ -1609,6 +1675,10 @@ class MainWindow(QMainWindow):
         leg_y.setStyleSheet("background-color: #faf5ff; color: #9333ea; border: 1px solid #e9d5ff; border-radius: 6px; padding: 3px 8px; font-weight: 600; font-family: 'JetBrains Mono'; font-size: 10px;")
         scope_head.addWidget(leg_y)
 
+        leg_z = QLabel("— ΔZ (Out-of-Plane)")
+        leg_z.setStyleSheet("background-color: #fff7ed; color: #ea580c; border: 1px solid #ffedd5; border-radius: 6px; padding: 3px 8px; font-weight: 600; font-family: 'JetBrains Mono'; font-size: 10px;")
+        scope_head.addWidget(leg_z)
+
         scope_layout.addLayout(scope_head)
 
         # PyQtGraph Widget
@@ -1624,9 +1694,10 @@ class MainWindow(QMainWindow):
         zero_line = pg.InfiniteLine(pos=0, angle=0, pen=pg.mkPen(color='#94a3b8', width=1, style=Qt.PenStyle.DashLine))
         self.plot_widget.addItem(zero_line)
 
-        # Kurva X (Deep Sky Blue) & Kurva Y (Purple)
+        # Kurva X (Deep Sky Blue), Kurva Y (Purple), Kurva Z (Amber-Orange)
         self.curve_x = self.plot_widget.plot(pen=pg.mkPen(color='#0284c7', width=2.5), name="ΔX (Lateral)")
         self.curve_y = self.plot_widget.plot(pen=pg.mkPen(color='#9333ea', width=2.0), name="ΔY (Axial)")
+        self.curve_z = self.plot_widget.plot(pen=pg.mkPen(color='#ea580c', width=2.0), name="ΔZ (Out-of-Plane)")
 
         scope_layout.addWidget(self.plot_widget, stretch=1)
 
@@ -1646,14 +1717,14 @@ class MainWindow(QMainWindow):
 
         # RIGHT (COL SPAN 5): HERO MEASUREMENTS, STATS & ACTIONS
         stats_col = QVBoxLayout()
-        stats_col.setSpacing(10)
+        stats_col.setSpacing(8)
 
         # Metric 1: Lateral Sway (ΔX)
         card_sway = QFrame()
         card_sway.setObjectName("metricCard")
         lay_sway = QVBoxLayout(card_sway)
-        lay_sway.setContentsMargins(12, 10, 12, 10)
-        lay_sway.setSpacing(4)
+        lay_sway.setContentsMargins(12, 7, 12, 7)
+        lay_sway.setSpacing(3)
 
         head_sway = QHBoxLayout()
         lbl_sway_t = QLabel("LATERAL SWAY (ΔX)")
@@ -1667,16 +1738,16 @@ class MainWindow(QMainWindow):
 
         row_sway_val = QHBoxLayout()
         self.lbl_sway_val = QLabel("+0.00")
-        self.lbl_sway_val.setStyleSheet("font-family: 'JetBrains Mono'; font-size: 28px; font-weight: bold; color: #0284c7;")
+        self.lbl_sway_val.setStyleSheet("font-family: 'JetBrains Mono'; font-size: 24px; font-weight: bold; color: #0284c7;")
         row_sway_val.addWidget(self.lbl_sway_val)
         lbl_mm1 = QLabel("mm")
-        lbl_mm1.setStyleSheet("font-family: 'JetBrains Mono'; font-size: 12px; color: #64748b; padding-top: 10px;")
+        lbl_mm1.setStyleSheet("font-family: 'JetBrains Mono'; font-size: 12px; color: #64748b; padding-top: 6px;")
         row_sway_val.addWidget(lbl_mm1)
         row_sway_val.addStretch()
         lay_sway.addLayout(row_sway_val)
 
         self.lbl_sway_limits = QLabel("Max: +0.00 mm  |  Min: -0.00 mm")
-        self.lbl_sway_limits.setStyleSheet("color: #64748b; font-family: 'JetBrains Mono'; font-size: 11px; border-top: 1px solid #e2e8f0; padding-top: 4px;")
+        self.lbl_sway_limits.setStyleSheet("color: #64748b; font-family: 'JetBrains Mono'; font-size: 11px; border-top: 1px solid #e2e8f0; padding-top: 3px;")
         lay_sway.addWidget(self.lbl_sway_limits)
         stats_col.addWidget(card_sway)
 
@@ -1684,8 +1755,8 @@ class MainWindow(QMainWindow):
         card_drop = QFrame()
         card_drop.setObjectName("metricCard")
         lay_drop = QVBoxLayout(card_drop)
-        lay_drop.setContentsMargins(12, 10, 12, 10)
-        lay_drop.setSpacing(4)
+        lay_drop.setContentsMargins(12, 7, 12, 7)
+        lay_drop.setSpacing(3)
 
         head_drop = QHBoxLayout()
         lbl_drop_t = QLabel("VERTICAL DROP (ΔY)")
@@ -1699,18 +1770,50 @@ class MainWindow(QMainWindow):
 
         row_drop_val = QHBoxLayout()
         self.lbl_drop_val = QLabel("-0.00")
-        self.lbl_drop_val.setStyleSheet("font-family: 'JetBrains Mono'; font-size: 28px; font-weight: bold; color: #9333ea;")
+        self.lbl_drop_val.setStyleSheet("font-family: 'JetBrains Mono'; font-size: 24px; font-weight: bold; color: #9333ea;")
         row_drop_val.addWidget(self.lbl_drop_val)
         lbl_mm2 = QLabel("mm")
-        lbl_mm2.setStyleSheet("font-family: 'JetBrains Mono'; font-size: 12px; color: #64748b; padding-top: 10px;")
+        lbl_mm2.setStyleSheet("font-family: 'JetBrains Mono'; font-size: 12px; color: #64748b; padding-top: 6px;")
         row_drop_val.addWidget(lbl_mm2)
         row_drop_val.addStretch()
         lay_drop.addLayout(row_drop_val)
 
         self.lbl_drop_limits = QLabel("Max: +0.00 mm  |  Min: -0.00 mm")
-        self.lbl_drop_limits.setStyleSheet("color: #64748b; font-family: 'JetBrains Mono'; font-size: 11px; border-top: 1px solid #e2e8f0; padding-top: 4px;")
+        self.lbl_drop_limits.setStyleSheet("color: #64748b; font-family: 'JetBrains Mono'; font-size: 11px; border-top: 1px solid #e2e8f0; padding-top: 3px;")
         lay_drop.addWidget(self.lbl_drop_limits)
         stats_col.addWidget(card_drop)
+
+        # Metric 3: Out-of-Plane Motion (ΔZ)
+        card_depth = QFrame()
+        card_depth.setObjectName("metricCard")
+        lay_depth = QVBoxLayout(card_depth)
+        lay_depth.setContentsMargins(12, 7, 12, 7)
+        lay_depth.setSpacing(3)
+
+        head_depth = QHBoxLayout()
+        lbl_depth_t = QLabel("OUT-OF-PLANE (ΔZ)")
+        lbl_depth_t.setStyleSheet("font-size: 10px; font-weight: 700; color: #64748b; letter-spacing: 0.5px;")
+        head_depth.addWidget(lbl_depth_t)
+        head_depth.addStretch()
+        self.badge_depth_dir = QLabel("Stable")
+        self.badge_depth_dir.setStyleSheet("color: #ea580c; font-family: 'JetBrains Mono'; font-size: 10px; font-weight: 600;")
+        head_depth.addWidget(self.badge_depth_dir)
+        lay_depth.addLayout(head_depth)
+
+        row_depth_val = QHBoxLayout()
+        self.lbl_depth_val = QLabel("+0.00")
+        self.lbl_depth_val.setStyleSheet("font-family: 'JetBrains Mono'; font-size: 24px; font-weight: bold; color: #ea580c;")
+        row_depth_val.addWidget(self.lbl_depth_val)
+        lbl_mm3 = QLabel("mm")
+        lbl_mm3.setStyleSheet("font-family: 'JetBrains Mono'; font-size: 12px; color: #64748b; padding-top: 6px;")
+        row_depth_val.addWidget(lbl_mm3)
+        row_depth_val.addStretch()
+        lay_depth.addLayout(row_depth_val)
+
+        self.lbl_depth_limits = QLabel("Max: +0.00 mm  |  Min: -0.00 mm")
+        self.lbl_depth_limits.setStyleSheet("color: #64748b; font-family: 'JetBrains Mono'; font-size: 11px; border-top: 1px solid #e2e8f0; padding-top: 3px;")
+        lay_depth.addWidget(self.lbl_depth_limits)
+        stats_col.addWidget(card_depth)
 
         # Dual Summary Badges: Drift Ratio & Natural Frequency
         row_dual_badges = QHBoxLayout()
@@ -1924,6 +2027,14 @@ class MainWindow(QMainWindow):
                     )
                     return
 
+                # Otomatis tambahkan /video jika pengguna hanya memasukkan host:port (misal http://192.168.18.15:8080)
+                if source.startswith("http://") or source.startswith("https://"):
+                    from urllib.parse import urlparse
+                    parsed = urlparse(source)
+                    if not parsed.path or parsed.path == "/":
+                        source = source.rstrip("/") + "/video"
+                        self.txt_ip_url.setText(source)
+
             self.lbl_video.setText("Menghubungkan ke sumber kamera, mohon tunggu...")
             self.btn_connect.setEnabled(False)
             self.btn_connect.setText("Menghubungkan...")
@@ -1949,11 +2060,12 @@ class MainWindow(QMainWindow):
             self.btn_connect.setStyleSheet("background-color: #ecfdf5; border: 1px solid #10b981; color: #059669;")
             self.btn_start.setEnabled(True)
             self.btn_stop.setEnabled(False)
-            self.pill_cam.setText("● Camera Connected")
+            res_info = f" ({self.worker.resolution_str})" if (self.worker and getattr(self.worker, 'resolution_str', '')) else ""
+            self.pill_cam.setText(f"● Camera Connected{res_info}")
             self.pill_cam.setStyleSheet("background-color: #ecfdf5; color: #059669; border: 1px solid #a7f3d0; border-radius: 14px; padding: 5px 12px; font-weight: 600; font-size: 11px;")
-            self.lbl_cam_status.setText("● Linked")
+            self.lbl_cam_status.setText(f"● Linked{res_info}")
             self.lbl_cam_status.setStyleSheet("color: #059669; font-size: 11px; font-weight: 600;")
-            self.lbl_ft_cam.setText("● Camera: Connected")
+            self.lbl_ft_cam.setText(f"● Camera: Connected{res_info}")
             self.lbl_ft_cam.setStyleSheet("color: #059669; font-family: 'JetBrains Mono'; font-size: 11px;")
         else:
             self.btn_connect.setText("Hubungkan Kamera")
@@ -1990,7 +2102,7 @@ class MainWindow(QMainWindow):
             scaled_pixmap = pixmap.scaled(
                 w, h,
                 Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.FastTransformation
+                Qt.TransformationMode.SmoothTransformation
             )
             self.lbl_video.setPixmap(scaled_pixmap)
 
@@ -2031,15 +2143,20 @@ class MainWindow(QMainWindow):
         self.time_buffer.clear()
         self.x_buffer.clear()
         self.y_buffer.clear()
+        self.z_buffer.clear()
         self.curve_x.setData([], [])
         self.curve_y.setData([], [])
+        self.curve_z.setData([], [])
 
         self.max_x = -float('inf')
         self.min_x = float('inf')
         self.max_y = -float('inf')
         self.min_y = float('inf')
+        self.max_z = -float('inf')
+        self.min_z = float('inf')
         self.sum_sq_x = 0.0
         self.sum_sq_y = 0.0
+        self.sum_sq_z = 0.0
         self.count_samples = 0
         self.total_frames_seen = 0
         self.locked_frames_count = 0
@@ -2090,7 +2207,7 @@ class MainWindow(QMainWindow):
             self.lbl_tare_percent.setText(f"{percent}% Tare...")
             self.lbl_tare_percent.setStyleSheet("font-family: 'JetBrains Mono'; font-size: 11px; color: #0284c7; font-weight: bold;")
 
-    def on_new_data_point(self, now, frame_idx, disp_x, disp_y, status, g_ok, t_ok):
+    def on_new_data_point(self, now, frame_idx, disp_x, disp_y, disp_z, status, g_ok, t_ok):
         # 1. Update status marker di sidebar & footer
         self.total_frames_seen += 1
         locked_both = g_ok and t_ok
@@ -2120,14 +2237,17 @@ class MainWindow(QMainWindow):
         self.time_buffer.append(now)
         self.x_buffer.append(disp_x)
         self.y_buffer.append(disp_y)
+        self.z_buffer.append(disp_z)
 
         while self.time_buffer and now - self.time_buffer[0] > self.plot_window_sec:
             self.time_buffer.popleft()
             self.x_buffer.popleft()
             self.y_buffer.popleft()
+            self.z_buffer.popleft()
 
         self.curve_x.setData(list(self.time_buffer), list(self.x_buffer))
         self.curve_y.setData(list(self.time_buffer), list(self.y_buffer))
+        self.curve_z.setData(list(self.time_buffer), list(self.z_buffer))
 
         # 3. Update Hero Metrics
         self.count_samples += 1
@@ -2135,10 +2255,13 @@ class MainWindow(QMainWindow):
         self.min_x = min(self.min_x, disp_x)
         self.max_y = max(self.max_y, disp_y)
         self.min_y = min(self.min_y, disp_y)
+        self.max_z = max(self.max_z, disp_z)
+        self.min_z = min(self.min_z, disp_z)
 
         unit = "mm" if self.spin_scale.value() else "px"
         self.lbl_sway_val.setText(f"{disp_x:+.2f}")
         self.lbl_drop_val.setText(f"{disp_y:+.2f}")
+        self.lbl_depth_val.setText(f"{disp_z:+.2f}")
 
         # Direction indicator
         if disp_x > 0.5:
@@ -2151,8 +2274,20 @@ class MainWindow(QMainWindow):
             self.badge_sway_dir.setText("Centered")
             self.badge_sway_dir.setStyleSheet("color: #64748b; font-family: 'JetBrains Mono'; font-size: 10px; font-weight: 600;")
 
+        # Z Direction indicator (Forward/Backward)
+        if disp_z > 0.5:
+            self.badge_depth_dir.setText("Forward (+Z)")
+            self.badge_depth_dir.setStyleSheet("color: #ea580c; font-family: 'JetBrains Mono'; font-size: 10px; font-weight: 600;")
+        elif disp_z < -0.5:
+            self.badge_depth_dir.setText("Backward (-Z)")
+            self.badge_depth_dir.setStyleSheet("color: #d97706; font-family: 'JetBrains Mono'; font-size: 10px; font-weight: 600;")
+        else:
+            self.badge_depth_dir.setText("Stable")
+            self.badge_depth_dir.setStyleSheet("color: #64748b; font-family: 'JetBrains Mono'; font-size: 10px; font-weight: 600;")
+
         self.lbl_sway_limits.setText(f"Max: {self.max_x:+.2f} {unit}  |  Min: {self.min_x:+.2f} {unit}")
         self.lbl_drop_limits.setText(f"Max: {self.max_y:+.2f} {unit}  |  Min: {self.min_y:+.2f} {unit}")
+        self.lbl_depth_limits.setText(f"Max: {self.max_z:+.2f} {unit}  |  Min: {self.min_z:+.2f} {unit}")
 
         # 4. Drift Ratio & Frekuensi Alami Dominan
         # Asumsi tinggi gedung referensi ~400mm jika belum spesifik, atau gunakan rasio displacement
@@ -2198,16 +2333,16 @@ class MainWindow(QMainWindow):
 
             headers = [
                 "timestamp_s", "frame",
-                f"ground_x_{unit_label}", f"ground_y_{unit_label}",
-                f"top_x_{unit_label}", f"top_y_{unit_label}",
-                f"disp_x_{unit_label}", f"disp_y_{unit_label}",
+                f"ground_x_{unit_label}", f"ground_y_{unit_label}", f"ground_z_{unit_label}",
+                f"top_x_{unit_label}", f"top_y_{unit_label}", f"top_z_{unit_label}",
+                f"disp_x_{unit_label}", f"disp_y_{unit_label}", f"disp_z_{unit_label}",
                 "status"
             ]
             units = [
                 "[s]", "[frame#]",
-                f"[{pos_unit}]", f"[{pos_unit}]",
-                f"[{pos_unit}]", f"[{pos_unit}]",
-                f"[{disp_unit}]", f"[{disp_unit}]",
+                f"[{pos_unit}]", f"[{pos_unit}]", f"[{pos_unit}]",
+                f"[{pos_unit}]", f"[{pos_unit}]", f"[{pos_unit}]",
+                f"[{disp_unit}]", f"[{disp_unit}]", f"[{disp_unit}]",
                 "[-]"
             ]
 
@@ -2250,9 +2385,9 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 errors.append(f"TXT: {e}")
 
-            # 4. Simpan PNG
+            # 4. Simpan PNG (3 Sumbu: X, Y, Z)
             try:
-                if save_png_plot(png_path, summary.get("t_all", []), summary.get("x_all", []), summary.get("y_all", []), unit_label):
+                if save_png_plot(png_path, summary.get("t_all", []), summary.get("x_all", []), summary.get("y_all", []), summary.get("z_all", []), unit_label):
                     self.last_saved_png = os.path.abspath(png_path)
                     self.btn_open_png.setEnabled(True)
                     saved_items.append(f"Grafik: result/{os.path.basename(png_path)}")
