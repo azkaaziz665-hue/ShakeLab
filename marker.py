@@ -21,6 +21,7 @@ Cara pakai:
     5. Tekan 'q' untuk berhenti & menyimpan data
 """
 
+import os
 import cv2
 import numpy as np
 import csv
@@ -30,6 +31,7 @@ from collections import deque
 import matplotlib
 matplotlib.use("TkAgg")  # ganti ke "Qt5Agg" kalau TkAgg error di sistemmu
 import matplotlib.pyplot as plt
+from measurement_quality import assess_baseline, lowpass_step
 
 try:
     import openpyxl
@@ -59,7 +61,7 @@ TOP_MARKER_ID = 1
 # biarkan None -> program tetap jalan tapi satuan tetap piksel.
 PIXEL_TO_MM = 0.265   # contoh: 100mm / 378px ≈ 0.265 mm/px (layar 96dpi)
 
-BASELINE_FRAMES = 30      # jumlah frame awal (diam) untuk hitung baseline
+BASELINE_FRAMES = 60      # indikator progres tare; kestabilan juga diverifikasi selama >=2 detik
 MAX_MISSING_FRAMES = 10   # toleransi berapa frame boleh "hilang" sebelum dianggap gap
 PLOT_WINDOW_SEC = 10       # rentang waktu yang ditampilkan di grafik live (detik)
 
@@ -238,6 +240,12 @@ def main():
     # Baseline (posisi relatif saat gedung diam)
     baseline_samples = []
     baseline_rel = None
+    filtered_x, filtered_y = None, None
+    filter_time = None
+
+    # Origin posisi absolut — agar ground_x/y dan top_x/y dimulai dari 0
+    origin_ground = None   # (gx0, gy0) posisi awal ground dalam satuan fisik
+    origin_top    = None   # (tx0, ty0) posisi awal top dalam satuan fisik
 
     # Buffer untuk plot live (hanya window terakhir)
     t_buffer = deque()
@@ -311,18 +319,34 @@ def main():
                 last_top = top_pos
                 last_top_size = top_size
 
-            if ground_pos and top_pos and status != "missing":
+            # Posisi interpolasi dipakai hanya agar tampilan tidak putus; tidak
+            # ikut menjadi baseline, statistik, maupun data ekspor.
+            if ground_pos and top_pos and status == "ok":
                 rel_x = top_pos[0] - ground_pos[0]
                 rel_y = top_pos[1] - ground_pos[1]
 
                 # Kumpulkan baseline dari frame-frame paling awal (kondisi diam)
-                if len(baseline_samples) < BASELINE_FRAMES:
-                    baseline_samples.append((rel_x, rel_y, ground_size or 50.0, top_size or 50.0))
-                    if len(baseline_samples) == BASELINE_FRAMES:
+                if baseline_rel is None:
+                    baseline_samples.append((now, rel_x, rel_y, ground_size or 50.0, top_size or 50.0))
+                    if len(baseline_samples) > 120:
+                        baseline_samples.pop(0)
+                    baseline_result = assess_baseline(
+                        [s[0] for s in baseline_samples],
+                        [s[1] for s in baseline_samples],
+                        [s[2] for s in baseline_samples],
+                        PIXEL_TO_MM or 1.0,
+                    )
+                    if baseline_result["valid"]:
                         arr = np.array(baseline_samples)
-                        baseline_rel = (arr[:, 0].mean(), arr[:, 1].mean())
-                        baseline_sizes = (arr[:, 2].mean(), arr[:, 3].mean())
+                        baseline_rel = (baseline_result["baseline_x_px"], baseline_result["baseline_y_px"])
+                        baseline_sizes = (arr[:, 3].mean(), arr[:, 4].mean())
+
+                        # Simpan posisi absolut awal sebagai origin (titik nol)
+                        scale0 = PIXEL_TO_MM if PIXEL_TO_MM else 1.0
+                        origin_ground = (ground_pos[0] * scale0, ground_pos[1] * scale0)
+                        origin_top    = (top_pos[0]    * scale0, top_pos[1]    * scale0)
                         print(f"Baseline terkalibrasi: XY={baseline_rel}, Sizes={baseline_sizes}")
+                        print(f"Origin ground: {origin_ground}, Origin top: {origin_top}")
 
                 if baseline_rel is not None:
                     disp_x = rel_x - baseline_rel[0]
@@ -332,12 +356,28 @@ def main():
                         disp_x *= PIXEL_TO_MM
                         disp_y *= PIXEL_TO_MM
 
-                    # Konversi posisi absolut ke satuan fisik (jika tersedia)
+                    dt_s = now - filter_time if filter_time is not None else 0.0
+                    filtered_x = lowpass_step(disp_x, filtered_x, dt_s)
+                    filtered_y = lowpass_step(disp_y, filtered_y, dt_s)
+                    filter_time = now
+                    disp_x, disp_y = filtered_x, filtered_y
+
+                    # Konversi posisi absolut ke satuan fisik, lalu normalisasi ke 0
                     scale = PIXEL_TO_MM if PIXEL_TO_MM else 1.0
-                    g_x = ground_pos[0] * scale
-                    g_y = ground_pos[1] * scale
-                    t_x = top_pos[0] * scale
-                    t_y = top_pos[1] * scale
+                    g_x_abs = ground_pos[0] * scale
+                    g_y_abs = ground_pos[1] * scale
+                    t_x_abs = top_pos[0]    * scale
+                    t_y_abs = top_pos[1]    * scale
+
+                    # Kurangi dengan origin agar posisi dimulai dari 0
+                    if origin_ground is not None and origin_top is not None:
+                        g_x = g_x_abs - origin_ground[0]
+                        g_y = g_y_abs - origin_ground[1]
+                        t_x = t_x_abs - origin_top[0]
+                        t_y = t_y_abs - origin_top[1]
+                    else:
+                        g_x, g_y = g_x_abs, g_y_abs
+                        t_x, t_y = t_x_abs, t_y_abs
 
                     # Sumbu Z (Out-of-Plane)
                     w_frame = frame.shape[1]

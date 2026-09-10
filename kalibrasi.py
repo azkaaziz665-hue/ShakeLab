@@ -110,14 +110,20 @@ def main():
     global frozen_frame, clicks, last_result
 
     if USE_IP_CAMERA:
-        print(f"Menghubungkan ke IP Camera HP: {IP_CAMERA_URL} ...")
-        cap = cv2.VideoCapture(IP_CAMERA_URL)
+        url = IP_CAMERA_URL.strip()
+        if (url.startswith("http://") or url.startswith("https://")) and url.endswith((":8080", ":4747", ":8080/", ":4747/")):
+            url = url.rstrip("/") + "/video"
+        print(f"Menghubungkan ke IP Camera HP: {url} ...")
+        import os
+        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "nobuffer;max_delay=500000"
+        cap = cv2.VideoCapture(url)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     else:
         print(f"Membuka kamera USB/Laptop (Index: {CAMERA_INDEX}) ...")
         cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_DSHOW)  # CAP_DSHOW stabil di Windows
-
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
     if not cap.isOpened():
         if USE_IP_CAMERA:

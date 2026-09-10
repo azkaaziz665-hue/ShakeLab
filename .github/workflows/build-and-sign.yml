@@ -1,4 +1,4 @@
-name: Build and Release ShakeLab
+﻿name: Build and Release ShakeLab
 
 on:
   push:

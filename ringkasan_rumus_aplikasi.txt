@@ -1,0 +1,122 @@
+RINGKASAN RUMUS AKTIF SHAKELAB
+Analisis Getaran dan Pergeseran Miniatur Bangunan
+
+1. NOTASI
+
+G = marker Ground ID #0 pada meja/base.
+T = marker Top ID #1 pada bagian atas miniatur.
+(X, Y) = pusat marker pada citra kamera dalam pixel.
+(X0, Y0) = pusat marker ketika baseline/tare selesai.
+L_G, L_T = sisi fisik marker Ground dan Top dalam mm.
+s_G, s_T = sisi marker pada citra dalam px.
+S_G, S_T = skala lokal Ground dan Top dalam mm/px.
+
+Konvensi citra: +X ke kanan kamera, +Y ke bawah kamera. Delta Z adalah
+gerak menuju atau menjauhi kamera.
+
+2. DETEKSI MARKER ARUCO
+
+Dengan empat sudut marker p0, p1, p2, p3:
+  Cx = (x0 + x1 + x2 + x3) / 4
+  Cy = (y0 + y1 + y2 + y3) / 4
+  s_marker = (s0 + s1 + s2 + s3) / 4
+  si = sqrt((xj - xi)^2 + (yj - yi)^2)
+
+3. DUA SKALA LOKAL PIXEL KE MILLIMETER
+
+Setiap marker memakai skala berdasarkan ukuran sisi fisik yang dicetak dan
+ukuran marker pada citra saat kalibrasi:
+  S_G = L_G / s_G       [mm/px]
+  S_T = L_T / s_T       [mm/px]
+
+Kalibrasi Delta X/Y tidak memerlukan tinggi antar-marker H atau offset lateral
+X. Tinggi miniatur tetap diperlukan untuk menghitung drift ratio.
+
+4. BASELINE ATAU TARE
+
+Baseline diterima bila kedua marker terlihat, minimal 30 sampel valid selama
+minimal 2 detik, dan miniatur/kamera cukup stabil.
+
+  rX_i = (X_Ti - X_Gi) x max(S_G, S_T)
+  rY_i = (Y_Ti - Y_Gi) x max(S_G, S_T)
+  std_baseline = max(std(rX), std(rY))
+  p2p_baseline = max(max(rX)-min(rX), max(rY)-min(rY))
+
+Syarat bawaan: std_baseline <= 0.35 mm dan p2p_baseline <= 1.50 mm. Bila
+kondisi belum stabil setelah 5 detik, aplikasi mengunci baseline median agar
+perekaman tidak berhenti tanpa data; laporan kualitas menandai baseline ini
+sebagai kurang stabil.
+
+5. POSISI LOKAL DAN SIMPANGAN RELATIF
+
+  ground_x(t) = [X_G(t) - X_G0] x S_G
+  ground_y(t) = [Y_G(t) - Y_G0] x S_G
+  top_x(t) = [X_T(t) - X_T0] x S_T
+  top_y(t) = [Y_T(t) - Y_T0] x S_T
+
+  disp_x_raw(t) = top_x(t) - ground_x(t)
+  disp_y_raw(t) = top_y(t) - ground_y(t)
+
+Jika Ground dan Top bergerak bersama 20 mm ke arah sama, ground_x dan top_x
+sama-sama 20 mm sehingga disp_x mendekati 0 mm.
+
+6. FILTER LOW-PASS DELTA X DAN DELTA Y
+
+Filter orde satu memakai cutoff fc = 12 Hz:
+  RC = 1 / (2 x pi x fc)
+  alpha = dt / (RC + dt)
+  d(t) = d(t-dt) + alpha x [d_raw(t) - d(t-dt)]
+
+Rumus diterapkan pada disp_x_raw dan disp_y_raw menggunakan interval frame
+aktual. Hasilnya adalah disp_x dan disp_y pada grafik serta ekspor.
+
+7. DELTA Z
+
+Bila camera_intrinsics.json tersedia, pose marker dihitung dengan solvePnP:
+  disp_z_raw(t) = [Z_T(t) - Z_T0] - [Z_G(t) - Z_G0]
+
+Tanpa kalibrasi kamera 3D, estimasi optik cadangan adalah:
+  z_G(t) = (0.85 x lebar_frame_px x S_G) x [s_G0 / s_G(t) - 1]
+  z_T(t) = (0.85 x lebar_frame_px x S_T) x [s_T0 / s_T(t) - 1]
+  disp_z_raw(t) = z_T(t) - z_G(t)
+
+Nilai disp_z adalah rata-rata bergerak hingga 15 frame.
+
+8. DRIFT RATIO
+
+Dengan tinggi miniatur h dalam mm:
+  drift_ratio(t) = |disp_x(t)| / h x 100 persen
+
+9. FREKUENSI DOMINAN FFT
+
+Data disp_x valid dalam buffer hingga 20 detik diinterpolasi pada interval
+median, tren linear dihilangkan, lalu diberi jendela Hann:
+  fs = 1 / median(t_i - t_i-1)
+  x_detrend(t) = x(t) - (a x t + b)
+  w[n] = 0.5 - 0.5 x cos(2 x pi x n / (N-1))
+  A[k] = |RFFT(x_detrend[n] x w[n])|
+  f[k] = k x fs / N
+  SNR_dB = 20 x log10(A_peak / median(A_noise))
+
+Frekuensi ditampilkan bila minimal 64 sampel, durasi minimal 2 detik, dan
+SNR >= 6 dB.
+
+10. STATISTIK GRAFIK
+
+  maksimum = max(q_i)
+  minimum = min(q_i)
+  RMS = sqrt((1/N) x sum(q_i^2))
+
+11. UJI FISIK DAN KOREKSI SKALA LOKAL
+
+Untuk menguji S_G, geser Ground dengan Top diam dan gunakan hasil ground_x.
+Untuk menguji S_T, geser Top dengan Ground diam dan gunakan hasil top_x.
+
+  galat_mm = ||A| - |R||
+  galat_persen = galat_mm / |R| x 100 persen
+  S_G_baru = S_G_lama x |R| / |A_G|
+  S_T_baru = S_T_lama x |R| / |A_T|
+
+R adalah pergeseran fisik referensi dan A adalah pembacaan marker yang diuji.
+Gunakan uji 5, 10, 20, dan 30 mm sebelum menerapkan koreksi. Delta X tidak
+digunakan untuk mengoreksi satu skala lokal.

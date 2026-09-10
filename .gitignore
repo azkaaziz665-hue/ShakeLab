@@ -1,4 +1,4 @@
-﻿# Python cache
+# Python cache
 __pycache__/
 *.pyc
 *.pyo
@@ -10,12 +10,14 @@ dist/
 *.spec
 
 # Data hasil pengujian (jangan diupload ke publik)
+result/
 *.csv
 *.xlsx
 grafik_*.png
 tabel_*.txt
 data_*.csv
 data_*.xlsx
+kualitas_*.json
 
 # Sertifikat keamanan (RAHASIA - jangan pernah diupload!)
 *.pfx

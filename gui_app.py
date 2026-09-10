@@ -13,7 +13,9 @@ import sys
 import os
 import time
 import csv
+import json
 import shutil
+import subprocess
 from collections import deque
 
 
@@ -31,6 +33,11 @@ def get_resource_path(relative_name: str) -> str:
 import cv2
 import numpy as np
 
+from signal_analysis import calculate_drift_ratio, estimate_dominant_frequency
+from measurement_quality import assess_baseline, lowpass_step, quality_summary, validate_known_displacement
+from camera_calibration import estimate_marker_size_depth_change, load_intrinsics, save_intrinsics
+from local_scale import marker_scale_mm_per_px, relative_local_displacement
+
 # Matplotlib untuk menyimpan grafik PNG akhir (backend non-interaktif murni)
 import matplotlib
 matplotlib.use("Agg")
@@ -46,13 +53,13 @@ try:
 except ImportError:
     HAS_OPENPYXL = False
 
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, pyqtSlot, QPoint, QSize, QRect, QRectF, QTimer
-from PyQt6.QtGui import QImage, QPixmap, QFont, QIcon, QPainter, QPen, QColor, QBrush, QPalette
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, pyqtSlot, QPoint, QPointF, QSize, QRect, QRectF, QTimer, QEvent
+from PyQt6.QtGui import QImage, QPixmap, QFont, QIcon, QPainter, QPen, QColor, QBrush, QPalette, QPolygonF
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QGridLayout, QFormLayout, QGroupBox, QPushButton, QLabel,
+    QGridLayout, QFormLayout, QGroupBox, QBoxLayout, QPushButton, QLabel,
     QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox, QRadioButton,
-    QButtonGroup, QCheckBox, QDialog, QMessageBox, QFileDialog,
+    QButtonGroup, QCheckBox, QDialog, QMessageBox, QFileDialog, QInputDialog,
     QProgressBar, QSplitter, QFrame, QScrollArea, QSizePolicy
 )
 
@@ -475,7 +482,7 @@ def export_to_excel(filename, headers, units, rows):
         return False
 
 
-def save_txt_table(filename, headers, rows, pixel_to_mm, frame_count):
+def save_txt_table(filename, headers, rows, calibration_text, frame_count, structure_height_mm=None):
     """Menyimpan tabel format ASCII bergaris ke file teks."""
     try:
         col_widths = [len(h) for h in headers]
@@ -487,7 +494,10 @@ def save_txt_table(filename, headers, rows, pixel_to_mm, frame_count):
 
         with open(filename, "w", encoding="utf-8") as tf:
             tf.write("HASIL SIMULASI UJI GEMPA - DATA DISPLACEMENT\n")
-            tf.write(f"Kalibrasi: {pixel_to_mm} mm/px | Total Frame: {frame_count}\n\n")
+            metadata = f"Kalibrasi: {calibration_text} | Total Frame: {frame_count}"
+            if structure_height_mm is not None:
+                metadata += f" | Tinggi Miniatur: {structure_height_mm:.1f} mm"
+            tf.write(metadata + "\n\n")
             tf.write(sep_line + "\n")
             hdr_str = "|" + "|".join([f" {headers[i]:^{col_widths[i]}} " for i in range(len(headers))]) + "|"
             tf.write(hdr_str + "\n")
@@ -499,6 +509,22 @@ def save_txt_table(filename, headers, rows, pixel_to_mm, frame_count):
         return True
     except Exception as e:
         print(f"Gagal simpan TXT: {e}")
+        return False
+
+
+def save_quality_report(filename, quality, calibration):
+    """Save a compact, machine-readable quality report beside each test result."""
+    try:
+        payload = {
+            "quality": quality,
+            "calibration": calibration,
+            "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        with open(filename, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+        return True
+    except Exception as e:
+        print(f"Gagal simpan laporan kualitas: {e}")
         return False
 
 
@@ -536,7 +562,7 @@ def save_png_plot(filename, t_all, x_all, y_all, z_all, unit_label):
         ax[1].axhline(0, color="#9333ea", linewidth=0.8, linestyle="--", alpha=0.5)
 
         # Sumbu Z
-        ax[2].plot(t_all, z_all, color="#ea580c", linewidth=1.5, label="ΔZ (Out-of-Plane)")
+        ax[2].plot(t_all, z_all, color="#ea580c", linewidth=1.5, label="ΔZ (Top Marker Scale)")
         ax[2].set_ylabel(f"ΔZ ({unit_label})", color='#ea580c', fontweight='bold')
         ax[2].set_xlabel("Waktu (detik)", color='#0f172a')
         ax[2].axhline(0, color="#ea580c", linewidth=0.8, linestyle="--", alpha=0.5)
@@ -544,12 +570,16 @@ def save_png_plot(filename, t_all, x_all, y_all, z_all, unit_label):
         series_data = [
             (ax[0], x_all, '#0284c7', 'ΔX Lateral'),
             (ax[1], y_all, '#9333ea', 'ΔY Axial'),
-            (ax[2], z_all, '#ea580c', 'ΔZ Out-of-Plane')
+            (ax[2], z_all, '#ea580c', 'ΔZ Skala Marker Top')
         ]
 
         for ax_s, vals, c, name in series_data:
-            arr = np.array(vals)
-            txt = f"{name} | Max: {arr.max():+.2f} | Min: {arr.min():+.2f} | RMS: {np.sqrt(np.mean(arr**2)):.2f} {unit_label}"
+            arr = np.asarray(vals, dtype=np.float64)
+            valid = arr[np.isfinite(arr)]
+            if valid.size:
+                txt = f"{name} | Max: {valid.max():+.2f} | Min: {valid.min():+.2f} | RMS: {np.sqrt(np.mean(valid**2)):.2f} {unit_label}"
+            else:
+                txt = f"{name} | Tidak ada pose tinggi yang valid"
             ax_s.annotate(txt, xy=(0.02, 0.90), xycoords="axes fraction",
                           fontsize=8.5, va="top", color=c,
                           bbox=dict(boxstyle="round,pad=0.3", fc="#ffffff", ec="#cbd5e1", alpha=0.95))
@@ -566,30 +596,59 @@ def save_png_plot(filename, t_all, x_all, y_all, z_all, unit_label):
 # DIALOG KALIBRASI INTERAKTIF (BEBAS GLITCH RESIZE)
 # =====================================================================
 class CalibrationCanvas(QWidget):
-    """Widget kanvas untuk mengklik 2 titik pada penggaris."""
+    """Widget kanvas untuk mengklik 2 titik pada penggaris atau menyorot marker ArUco terdeteksi."""
     pointsChanged = pyqtSignal(list, float)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.points = []
+        self.marker_items = []  # list of {'corners': [(x,y)...], 'label': str}
+        self.dimension_line = None  # {'p1': (x,y), 'p2': (x,y), 'label': str}
         self.original_pixmap = None
         self.setMinimumSize(400, 300)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setStyleSheet("background-color: #070e1d; border: 1px solid #2a364d; border-radius: 8px;")
 
     def set_frame(self, cv_img):
+        if cv_img is None:
+            return
         h, w, ch = cv_img.shape
         bytes_per_line = ch * w
         rgb_img = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
-        q_img = QImage(rgb_img.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
+        q_img = QImage(rgb_img.data, w, h, bytes_per_line, QImage.Format.Format_RGB888).copy()
         self.original_pixmap = QPixmap.fromImage(q_img)
-        self.points = []
         self.update()
 
     def reset_points(self):
         self.points = []
         self.update()
         self.pointsChanged.emit([], 0.0)
+
+    def set_marker_highlight(self, corners, label=""):
+        """Tampilkan kotak sorot 1 marker ArUco di kanvas."""
+        if corners:
+            self.marker_items = [{'corners': corners, 'label': label}]
+        else:
+            self.marker_items = []
+        self.update()
+
+    def set_multiple_marker_highlights(self, items):
+        """Tampilkan kotak sorot beberapa marker ArUco sekaligus di kanvas."""
+        self.marker_items = items if items else []
+        self.update()
+
+    def clear_marker_highlight(self):
+        self.marker_items = []
+        self.update()
+
+    def set_dimension_line(self, p1, p2, label=""):
+        """Tampilkan garis ukur dimensi vertikal antar-pusat marker di kanvas."""
+        self.dimension_line = {'p1': p1, 'p2': p2, 'label': label} if p1 and p2 else None
+        self.update()
+
+    def clear_dimension_line(self):
+        self.dimension_line = None
+        self.update()
 
     def _get_draw_params(self):
         if self.original_pixmap is None or self.original_pixmap.width() == 0 or self.original_pixmap.height() == 0:
@@ -604,27 +663,8 @@ class CalibrationCanvas(QWidget):
         return scale, offset_x, offset_y, disp_w, disp_h
 
     def mousePressEvent(self, event):
-        if self.original_pixmap is None:
-            return
-        if len(self.points) >= 2:
-            self.points = []
-
-        scale, offset_x, offset_y, disp_w, disp_h = self._get_draw_params()
-        pos = event.position()
-        mx, my = pos.x(), pos.y()
-
-        if offset_x <= mx <= offset_x + disp_w and offset_y <= my <= offset_y + disp_h:
-            orig_x = (mx - offset_x) / scale
-            orig_y = (my - offset_y) / scale
-            self.points.append((orig_x, orig_y))
-            
-            dist_px = 0.0
-            if len(self.points) == 2:
-                p1, p2 = np.array(self.points[0]), np.array(self.points[1])
-                dist_px = float(np.linalg.norm(p2 - p1))
-
-            self.update()
-            self.pointsChanged.emit(self.points, dist_px)
+        # Dalam mode fusi terpadu, deteksi marker dan garis dimensi dilakukan otomatis
+        pass
 
     def paintEvent(self, event):
         super().paintEvent(event)
@@ -644,173 +684,666 @@ class CalibrationCanvas(QWidget):
         target_rect = QRectF(offset_x, offset_y, disp_w, disp_h)
         painter.drawPixmap(target_rect.toRect(), self.original_pixmap)
 
-        for i, (orig_x, orig_y) in enumerate(self.points):
-            sx = int(offset_x + orig_x * scale)
-            sy = int(offset_y + orig_y * scale)
+        # Sorot Marker ArUco jika mode otomatis aktif (bisa 1 atau 2 marker sekaligus)
+        for item in self.marker_items:
+            corners = item.get('corners')
+            label = item.get('label', '')
+            if corners is not None and len(corners) == 4:
+                poly = QPolygonF()
+                for pt in corners:
+                    poly.append(QPointF(offset_x + pt[0] * scale, offset_y + pt[1] * scale))
+                
+                painter.setBrush(QBrush(QColor(16, 185, 129, 45)))
+                painter.setPen(QPen(QColor(16, 185, 129), 2, Qt.PenStyle.SolidLine))
+                painter.drawPolygon(poly)
 
-            painter.setBrush(QColor(52, 211, 153))
-            painter.setPen(QPen(QColor(255, 255, 255), 2))
-            painter.drawEllipse(QPoint(sx, sy), 7, 7)
-            painter.setFont(QFont("JetBrains Mono", 10, QFont.Weight.Bold))
-            painter.setPen(QColor(52, 211, 153))
-            painter.drawText(sx + 10, sy - 10, f"P{i+1}")
+                # Titik 4 sudut
+                for pt in corners:
+                    sx = int(offset_x + pt[0] * scale)
+                    sy = int(offset_y + pt[1] * scale)
+                    painter.setBrush(QColor(56, 189, 248))
+                    painter.setPen(QPen(QColor(255, 255, 255), 1))
+                    painter.drawEllipse(QPoint(sx, sy), 5, 5)
 
-        if len(self.points) == 2:
-            s1_x = int(offset_x + self.points[0][0] * scale)
-            s1_y = int(offset_y + self.points[0][1] * scale)
-            s2_x = int(offset_x + self.points[1][0] * scale)
-            s2_y = int(offset_y + self.points[1][1] * scale)
+                # Label nama & ukuran di atas marker
+                if label:
+                    cx = int(offset_x + np.mean([p[0] for p in corners]) * scale)
+                    min_y = int(offset_y + min(p[1] for p in corners) * scale) - 8
+                    painter.setFont(QFont("JetBrains Mono", 10, QFont.Weight.Bold))
+                    painter.setPen(QColor(16, 185, 129))
+                    painter.drawText(cx - 120, min_y - 16, 240, 20, Qt.AlignmentFlag.AlignCenter, label)
 
-            painter.setPen(QPen(QColor(56, 189, 248), 3, Qt.PenStyle.DashLine))
+        # Garis dimensi antar-marker jika mode tinggi aktif
+        if self.dimension_line is not None:
+            p1 = self.dimension_line['p1']
+            p2 = self.dimension_line['p2']
+            lbl = self.dimension_line.get('label', '')
+            s1_x = int(offset_x + p1[0] * scale)
+            s1_y = int(offset_y + p1[1] * scale)
+            s2_x = int(offset_x + p2[0] * scale)
+            s2_y = int(offset_y + p2[1] * scale)
+
+            painter.setPen(QPen(QColor(245, 158, 11), 2.5, Qt.PenStyle.DashLine))
             painter.drawLine(QPoint(s1_x, s1_y), QPoint(s2_x, s2_y))
 
-            dist_px = float(np.linalg.norm(np.array(self.points[1]) - np.array(self.points[0])))
-            mid_x = (s1_x + s2_x) // 2
-            mid_y = (s1_y + s2_y) // 2 - 12
-            painter.setFont(QFont("JetBrains Mono", 11, QFont.Weight.Bold))
-            painter.setPen(QColor(56, 189, 248))
-            painter.drawText(mid_x, mid_y, f"{dist_px:.1f} px")
+            painter.setBrush(QColor(245, 158, 11))
+            painter.setPen(QPen(QColor(255, 255, 255), 2))
+            painter.drawEllipse(QPoint(s1_x, s1_y), 5, 5)
+            painter.drawEllipse(QPoint(s2_x, s2_y), 5, 5)
+
+            if lbl:
+                mid_x = (s1_x + s2_x) // 2 + 15
+                mid_y = (s1_y + s2_y) // 2
+                painter.setFont(QFont("JetBrains Mono", 11, QFont.Weight.Bold))
+                fm = painter.fontMetrics()
+                txt_w = fm.horizontalAdvance(lbl) + 14
+                txt_h = fm.height() + 6
+                painter.setBrush(QColor(15, 23, 42, 220))
+                painter.setPen(QPen(QColor(245, 158, 11), 1))
+                painter.drawRoundedRect(mid_x - 6, mid_y - txt_h // 2, txt_w, txt_h, 4, 4)
+                painter.setPen(QColor(253, 230, 138))
+                painter.drawText(mid_x, mid_y + 4, lbl)
+
+
 
 
 class CalibrationDialog(QDialog):
-    """Dialog kalibrasi rasio pixel ke millimeter (mm/px)."""
-    def __init__(self, current_frame, current_val=0.265, parent=None):
+    """Calibrate independent local scales for the Ground and Top markers."""
+    def __init__(self, current_frame, ground_scale=0.265, top_scale=0.265,
+                 ground_marker_mm=40.0, top_marker_mm=40.0, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Scale Calibration — Ruler Tool")
-        self.resize(850, 600)
+        self.setWindowTitle("Kalibrasi Dua Skala Lokal")
+        self.resize(960, 720)
         self.setStyleSheet(MODERN_STYLE)
 
-        self.calculated_scale = current_val
-        self.dist_px = 0.0
+        self.setWindowFlags(
+            Qt.WindowType.Dialog |
+            Qt.WindowType.WindowCloseButtonHint
+        )
+
+        self.raw_frame = current_frame
+        self.ground_scale_mm_px = float(ground_scale)
+        self.top_scale_mm_px = float(top_scale)
+        self.detected_markers = {}  # mid -> {'corners': list of (x,y), 'center': (x,y), 'side_px': float, 'label': str}
+        self.last_detect_time = 0.0
+
+        # Inisialisasi detector ArUco sekali untuk performa live stream tinggi
+        aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
+        params = cv2.aruco.DetectorParameters()
+        try:
+            params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+        except Exception:
+            pass
+        self.detector = cv2.aruco.ArucoDetector(aruco_dict, params)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(16, 16, 16, 16)
-        layout.setSpacing(12)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(10)
 
-        info_card = QFrame()
-        info_card.setObjectName("sidebarCard")
-        info_lay = QVBoxLayout(info_card)
-        info_label = QLabel(
-            "<b>Instruksi Kalibrasi Skala:</b><br>"
-            "1. Klik <b>Titik 1 (P1)</b> pada penanda awal penggaris fisik di gambar.<br>"
-            "2. Klik <b>Titik 2 (P2)</b> pada penanda akhir penggaris fisik.<br>"
-            "3. Masukkan jarak fisik asli (dalam mm) di bawah, lalu klik 'Terapkan'."
-        )
-        info_label.setStyleSheet("color: #64748b; font-size: 12px;")
-        info_lay.addWidget(info_label)
-        layout.addWidget(info_card)
+        # Kartu Banner Informasi Metode Fusi Terpadu + Tombol Navigasi Layar
+        banner_card = QFrame()
+        banner_card.setObjectName("sidebarCard")
+        b_lay = QHBoxLayout(banner_card)
+        b_lay.setContentsMargins(14, 10, 14, 10)
+        b_lay.setSpacing(12)
 
+        txt_lay = QVBoxLayout()
+        lbl_banner_title = QLabel("KALIBRASI SKALA")
+        lbl_banner_title.setStyleSheet("color: #0284c7; font-size: 12px; font-weight: 800; letter-spacing: 0.5px;")
+        txt_lay.addWidget(lbl_banner_title)
+        b_lay.addLayout(txt_lay, stretch=1)
+
+        layout.addWidget(banner_card)
+
+        # Kanvas Gambar Preview Live Frame
         self.canvas = CalibrationCanvas(self)
         self.canvas.set_frame(current_frame)
-        self.canvas.pointsChanged.connect(self.on_points_changed)
         layout.addWidget(self.canvas, stretch=1)
 
-        calc_card = QFrame()
-        calc_card.setObjectName("sidebarCard")
-        calc_layout = QGridLayout(calc_card)
+        # Panel Input Parameter Fisik
+        param_card = QFrame()
+        param_card.setObjectName("sidebarCard")
+        p_grid = QGridLayout(param_card)
+        p_grid.setContentsMargins(14, 10, 14, 10)
+        p_grid.setHorizontalSpacing(16)
+        p_grid.setVerticalSpacing(6)
 
-        calc_layout.addWidget(QLabel("Jarak Terukur di Layar:"), 0, 0)
-        self.lbl_px = QLabel("0.0 piksel")
-        self.lbl_px.setStyleSheet("font-family: 'JetBrains Mono'; font-weight: bold; color: #0284c7;")
-        calc_layout.addWidget(self.lbl_px, 0, 1)
+        lbl_ground = QLabel("Sisi Marker Ground (ID #0):")
+        lbl_ground.setStyleSheet("font-weight: 700; color: #1e293b; font-size: 12px;")
+        self.spin_ground_marker_mm = QDoubleSpinBox()
+        self.spin_ground_marker_mm.setRange(5.0, 500.0)
+        self.spin_ground_marker_mm.setValue(float(ground_marker_mm))
+        self.spin_ground_marker_mm.setSuffix(" mm")
+        self.spin_ground_marker_mm.setMinimumHeight(34)
+        self.spin_ground_marker_mm.valueChanged.connect(self.compute_local_scales)
+        p_grid.addWidget(lbl_ground, 0, 0)
+        p_grid.addWidget(self.spin_ground_marker_mm, 0, 1)
 
-        calc_layout.addWidget(QLabel("Jarak Fisik Penggaris:"), 0, 2)
-        self.spin_mm = QDoubleSpinBox()
-        self.spin_mm.setRange(1.0, 10000.0)
-        self.spin_mm.setValue(100.0)
-        self.spin_mm.setSuffix(" mm")
-        self.spin_mm.setMinimumHeight(32)
-        self.spin_mm.valueChanged.connect(self.compute_scale)
-        calc_layout.addWidget(self.spin_mm, 0, 3)
+        lbl_top = QLabel("Sisi Marker Top (ID #1):")
+        lbl_top.setStyleSheet("font-weight: 700; color: #1e293b; font-size: 12px;")
+        self.spin_top_marker_mm = QDoubleSpinBox()
+        self.spin_top_marker_mm.setRange(5.0, 500.0)
+        self.spin_top_marker_mm.setValue(float(top_marker_mm))
+        self.spin_top_marker_mm.setSuffix(" mm")
+        self.spin_top_marker_mm.setMinimumHeight(34)
+        self.spin_top_marker_mm.valueChanged.connect(self.compute_local_scales)
+        p_grid.addWidget(lbl_top, 0, 2)
+        p_grid.addWidget(self.spin_top_marker_mm, 0, 3)
 
-        calc_layout.addWidget(QLabel("Hasil Skala (PIXEL_TO_MM):"), 1, 0)
-        self.lbl_result = QLabel(f"{current_val:.6f} mm/px")
-        self.lbl_result.setStyleSheet("font-family: 'JetBrains Mono'; font-size: 14px; font-weight: bold; color: #059669;")
-        calc_layout.addWidget(self.lbl_result, 1, 1, 1, 3)
+        # Status Indikator Deteksi Marker
+        self.lbl_marker_status = QLabel("Mendeteksi marker ArUco pada frame...")
+        self.lbl_marker_status.setStyleSheet("color: #64748b; font-size: 11px;")
+        p_grid.addWidget(self.lbl_marker_status, 1, 0, 1, 4)
 
-        layout.addWidget(calc_card)
+        layout.addWidget(param_card)
 
+        # Kartu Hasil Skala
+        res_card = QFrame()
+        res_card.setObjectName("sidebarCard")
+        res_lay = QVBoxLayout(res_card)
+        res_lay.setContentsMargins(14, 10, 14, 10)
+        res_lay.setSpacing(4)
+
+        top_res_lay = QGridLayout()
+        lbl_res_title = QLabel("Skala Lokal Ground:")
+        lbl_res_title.setStyleSheet("font-weight: 700; color: #1e293b; font-size: 12px;")
+        self.lbl_ground_result = QLabel(f"{ground_scale:.6f} mm/px")
+        self.lbl_ground_result.setStyleSheet("font-family: 'JetBrains Mono'; font-size: 15px; font-weight: bold; color: #059669;")
+        lbl_top_result = QLabel("Skala Lokal Top:")
+        lbl_top_result.setStyleSheet("font-weight: 700; color: #1e293b; font-size: 12px;")
+        self.lbl_top_result = QLabel(f"{top_scale:.6f} mm/px")
+        self.lbl_top_result.setStyleSheet("font-family: 'JetBrains Mono'; font-size: 15px; font-weight: bold; color: #0284c7;")
+        top_res_lay.addWidget(lbl_res_title, 0, 0)
+        top_res_lay.addWidget(self.lbl_ground_result, 0, 1)
+        top_res_lay.addWidget(lbl_top_result, 1, 0)
+        top_res_lay.addWidget(self.lbl_top_result, 1, 1)
+        res_lay.addLayout(top_res_lay)
+
+        layout.addWidget(res_card)
+
+        # Tombol Aksi Bawah
         btn_layout = QHBoxLayout()
-        btn_reset = QPushButton("Reset Titik")
-        btn_reset.clicked.connect(self.canvas.reset_points)
-        btn_layout.addWidget(btn_reset)
-
         btn_layout.addStretch()
 
         btn_cancel = QPushButton("Batal")
+        btn_cancel.setMinimumHeight(36)
+        btn_cancel.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_cancel.clicked.connect(self.reject)
         btn_layout.addWidget(btn_cancel)
 
-        self.btn_apply = QPushButton("Terapkan Skala Ini")
+        self.btn_apply = QPushButton("Terapkan Dua Skala (Enter)")
         self.btn_apply.setObjectName("btnStart")
+        self.btn_apply.setMinimumHeight(36)
+        self.btn_apply.setDefault(True)
+        self.btn_apply.setToolTip("Terapkan skala lokal Ground dan Top (Tekan Enter)")
+        self.btn_apply.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_apply.clicked.connect(self.accept)
-        self.btn_apply.setEnabled(False)
         btn_layout.addWidget(self.btn_apply)
 
         layout.addLayout(btn_layout)
 
-    def on_points_changed(self, points, dist_px):
-        self.dist_px = dist_px
-        self.lbl_px.setText(f"{dist_px:.2f} px")
-        if len(points) == 2 and dist_px > 0:
-            self.compute_scale()
-            self.btn_apply.setEnabled(True)
+        # Jalankan deteksi marker ArUco otomatis awal
+        self.detect_markers()
+
+    def update_live_frame(self, frame):
+        """Menerima live frame berkelanjutan dari kamera agar preview tidak freeze."""
+        if frame is None:
+            return
+        self.raw_frame = frame
+        self.canvas.set_frame(frame)
+
+        # Jalankan deteksi ArUco secara realtime berkala (~12 FPS)
+        now = time.time()
+        if now - self.last_detect_time >= 0.08:
+            self.last_detect_time = now
+            self.detect_markers()
+
+    def keyPressEvent(self, event):
+        """Fungsikan tombol Enter keyboard untuk konfirmasi penetapan nilai konversi."""
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            if self.btn_apply.isEnabled():
+                self.accept()
+            event.accept()
+        elif event.key() == Qt.Key.Key_Escape:
+            self.reject()
+            event.accept()
         else:
+            super().keyPressEvent(event)
+
+    def detect_markers(self):
+        self.detected_markers.clear()
+        if self.raw_frame is None:
+            self.lbl_marker_status.setText("⚠️ Frame kamera tidak tersedia.")
+            self.lbl_marker_status.setStyleSheet("color: #ea580c; font-size: 11px;")
+            self.btn_apply.setEnabled(False)
+            return
+
+        try:
+            gray = cv2.cvtColor(self.raw_frame, cv2.COLOR_BGR2GRAY)
+            corners, ids, _ = self.detector.detectMarkers(gray)
+
+            if ids is not None and len(ids) > 0:
+                for i, mid in enumerate(ids.flatten()):
+                    pts = corners[i][0]
+                    s0 = np.linalg.norm(pts[1] - pts[0])
+                    s1 = np.linalg.norm(pts[2] - pts[1])
+                    s2 = np.linalg.norm(pts[3] - pts[2])
+                    s3 = np.linalg.norm(pts[0] - pts[3])
+                    avg_side = float((s0 + s1 + s2 + s3) / 4.0)
+                    center_pt = (float(np.mean(pts[:, 0])), float(np.mean(pts[:, 1])))
+
+                    label = f"Ground (ID #{mid})" if mid == 0 else (f"Top (ID #{mid})" if mid == 1 else f"Marker ID #{mid}")
+                    self.detected_markers[int(mid)] = {
+                        'corners': [(float(p[0]), float(p[1])) for p in pts],
+                        'center': center_pt,
+                        'side_px': avg_side,
+                        'label': label
+                    }
+
+                self.compute_local_scales()
+            else:
+                self.lbl_marker_status.setText("⚠️ Tidak ada marker terdeteksi pada citra ini. Pastikan marker terlihat jelas di kamera.")
+                self.lbl_marker_status.setStyleSheet("color: #ea580c; font-size: 11px;")
+                self.btn_apply.setEnabled(False)
+        except Exception as e:
+            self.lbl_marker_status.setText(f"Error deteksi marker: {e}")
             self.btn_apply.setEnabled(False)
 
-    def compute_scale(self):
-        if self.dist_px > 0:
-            mm = self.spin_mm.value()
-            self.calculated_scale = mm / self.dist_px
-            self.lbl_result.setText(f"{self.calculated_scale:.6f} mm/px ({mm:.1f} mm / {self.dist_px:.1f} px)")
+    def _retired_fused_scale(self):
+        # Kedua marker harus memakai ID yang benar karena skalanya berbeda.
+        m_ground = self.detected_markers.get(0)
+        m_top = self.detected_markers.get(1)
+
+        # Fallback jika ID bukan 0 dan 1 tetapi ada minimal 2 marker terdeteksi:
+        if (not m_ground or not m_top) and len(self.detected_markers) >= 2:
+            keys = list(self.detected_markers.keys())
+            p1 = self.detected_markers[keys[0]]
+            p2 = self.detected_markers[keys[1]]
+            # Posisi Y lebih besar di layar (bawah citra) = Ground, posisi Y lebih kecil (atas citra) = Top
+            if p1['center'][1] > p2['center'][1]:
+                m_ground, m_top = p1, p2
+            else:
+                m_ground, m_top = p2, p1
+
+        if m_ground and m_top:
+            cg = m_ground['center']
+            ct = m_top['center']
+            dx = ct[0] - cg[0]
+            dy = ct[1] - cg[1]
+            delta_y = abs(dy)
+            dist_euclid = float(np.hypot(dx, dy))
+
+            s_ground = m_ground['side_px']
+            s_top = m_top['side_px']
+
+            h_mm = self.spin_height_mm.value()
+            l_mm = self.spin_marker_mm.value()
+            offset_x_mm = self.spin_offset_x_mm.value()
+
+            # Jika marker relatif segaris vertikal (|dx| < 0.5 * delta_y), pakai delta_y. Jika miring, pakai dist_euclid.
+            is_nearly_vertical = abs(dx) < 0.5 * max(delta_y, 1.0)
+            span_px = delta_y if is_nearly_vertical else dist_euclid
+            span_desc = f"ΔY={delta_y:.1f} px" if is_nearly_vertical else f"D_diag={dist_euclid:.1f} px"
+
+            # Pixel offset can be caused by perspective. Use declared physical
+            # dimensions to define the world-coordinate axes instead.
+            span_px = dist_euclid
+            span_mm = float(np.hypot(offset_x_mm, h_mm))
+            span_desc = f"D={dist_euclid:.1f} px | X={offset_x_mm:.1f} mm"
+
+            # Rumus Fusi: (L_ground + L_top + jarak pusat fisik) / piksel
+            total_mm = (2.0 * l_mm) + span_mm
+            total_px = s_ground + s_top + span_px
+
+            self.dist_px = total_px
+            if total_px > 0:
+                self.calculated_scale = total_mm / total_px
+                self.lbl_result.setText(f"{self.calculated_scale:.6f} mm/px")
+                self.btn_apply.setEnabled(True)
+
+            self.lbl_marker_status.setText(
+                f"✓ Berhasil terdeteksi: {m_ground['label']} ({s_ground:.1f} px) & {m_top['label']} ({s_top:.1f} px) | {span_desc}"
+            )
+            self.lbl_marker_status.setStyleSheet("color: #059669; font-size: 11px; font-weight: bold;")
+
+            items = [
+                {'corners': m_ground['corners'], 'label': f"{m_ground['label']} ({s_ground:.1f} px)"},
+                {'corners': m_top['corners'], 'label': f"{m_top['label']} ({s_top:.1f} px)"}
+            ]
+            self.canvas.set_multiple_marker_highlights(items)
+            self.canvas.set_dimension_line(cg, ct, f"H = {h_mm:.1f} mm ({span_desc})")
+        elif len(self.detected_markers) == 1:
+            m = list(self.detected_markers.values())[0]
+            self.lbl_marker_status.setText(f"⚠️ Baru 1 marker terdeteksi ({m['label']}). Diperlukan marker Ground & Top untuk kalibrasi fusi.")
+            self.lbl_marker_status.setStyleSheet("color: #ea580c; font-size: 11px;")
+            self.canvas.set_marker_highlight(m['corners'], f"{m['label']} ({m['side_px']:.1f} px)")
+            self.canvas.clear_dimension_line()
+            self.btn_apply.setEnabled(False)
+        else:
+            self.lbl_marker_status.setText("⚠️ Menunggu kedua marker (Ground & Top) terlihat di kamera.")
+            self.lbl_marker_status.setStyleSheet("color: #ea580c; font-size: 11px;")
+            self.canvas.clear_marker_highlight()
+            self.canvas.clear_dimension_line()
+            self.btn_apply.setEnabled(False)
+
+    # This second definition replaces the retired fused-scale implementation above.
+    def compute_local_scales(self):
+        m_ground = self.detected_markers.get(0)
+        m_top = self.detected_markers.get(1)
+        if not m_ground or not m_top:
+            self.btn_apply.setEnabled(False)
+            return
+
+        try:
+            self.ground_scale_mm_px = marker_scale_mm_per_px(
+                self.spin_ground_marker_mm.value(), m_ground["side_px"]
+            )
+            self.top_scale_mm_px = marker_scale_mm_per_px(
+                self.spin_top_marker_mm.value(), m_top["side_px"]
+            )
+        except ValueError:
+            self.btn_apply.setEnabled(False)
+            return
+
+        self.lbl_ground_result.setText(f"{self.ground_scale_mm_px:.6f} mm/px")
+        self.lbl_top_result.setText(f"{self.top_scale_mm_px:.6f} mm/px")
+        self.lbl_marker_status.setText(
+            f"Ground {m_ground['side_px']:.1f} px; Top {m_top['side_px']:.1f} px. Skala dihitung lokal."
+        )
+        self.lbl_marker_status.setStyleSheet("color: #059669; font-size: 11px; font-weight: bold;")
+        self.canvas.set_multiple_marker_highlights([
+            {"corners": m_ground["corners"], "label": f"Ground ({m_ground['side_px']:.1f} px)"},
+            {"corners": m_top["corners"], "label": f"Top ({m_top['side_px']:.1f} px)"},
+        ])
+        self.btn_apply.setEnabled(True)
+
+# =====================================================================
+# KALIBRASI INTRINSIK KAMERA UNTUK PENGUKURAN Z BERBASIS POSE
+# =====================================================================
+class CameraCalibrationDialog(QDialog):
+    """Collect checkerboard views and save camera intrinsics for pose-based Z."""
+    def __init__(self, current_frame, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Kalibrasi Kamera 3D")
+        self.resize(720, 600)
+        self.setStyleSheet(MODERN_STYLE)
+        self.raw_frame = current_frame
+        self.object_points = []
+        self.image_points = []
+        self.image_size = None
+        self.result_intrinsics = None
+
+        layout = QVBoxLayout(self)
+        self.preview = QLabel()
+        self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.preview.setMinimumSize(580, 380)
+        self.preview.setStyleSheet("background: #0f172a; border: 1px solid #334155;")
+        layout.addWidget(self.preview, 1)
+
+        form = QHBoxLayout()
+        self.spin_cols = QSpinBox()
+        self.spin_cols.setRange(3, 20)
+        self.spin_cols.setValue(9)
+        self.spin_rows = QSpinBox()
+        self.spin_rows.setRange(3, 20)
+        self.spin_rows.setValue(6)
+        self.spin_square = QDoubleSpinBox()
+        self.spin_square.setRange(1.0, 100.0)
+        self.spin_square.setValue(20.0)
+        self.spin_square.setSuffix(" mm")
+        for label, widget in (("Sudut kolom", self.spin_cols), ("Sudut baris", self.spin_rows), ("Sisi kotak", self.spin_square)):
+            form.addWidget(QLabel(label))
+            form.addWidget(widget)
+        layout.addLayout(form)
+
+        self.status = QLabel("Arahkan papan checkerboard ke beberapa sudut kamera, lalu ambil minimal 10 frame.")
+        self.status.setWordWrap(True)
+        self.status.setStyleSheet("color: #475569; font-size: 11px;")
+        layout.addWidget(self.status)
+
+        buttons = QHBoxLayout()
+        self.btn_capture = QPushButton("Ambil Frame")
+        self.btn_capture.clicked.connect(self.capture_frame)
+        self.btn_compute = QPushButton("Hitung dan Simpan")
+        self.btn_compute.setEnabled(False)
+        self.btn_compute.clicked.connect(self.compute_and_save)
+        btn_cancel = QPushButton("Tutup")
+        btn_cancel.clicked.connect(self.reject)
+        buttons.addWidget(self.btn_capture)
+        buttons.addWidget(self.btn_compute)
+        buttons.addStretch()
+        buttons.addWidget(btn_cancel)
+        layout.addLayout(buttons)
+        self.update_live_frame(current_frame)
+
+    def update_live_frame(self, frame):
+        if frame is None:
+            return
+        self.raw_frame = frame
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        h, w, channels = rgb.shape
+        image = QImage(rgb.data, w, h, channels * w, QImage.Format.Format_RGB888)
+        self.preview.setPixmap(QPixmap.fromImage(image).scaled(
+            self.preview.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation
+        ))
+
+    def capture_frame(self):
+        if self.raw_frame is None:
+            return
+        pattern = (self.spin_cols.value(), self.spin_rows.value())
+        gray = cv2.cvtColor(self.raw_frame, cv2.COLOR_BGR2GRAY)
+        found, corners = cv2.findChessboardCorners(gray, pattern)
+        if not found:
+            self.status.setText("Checkerboard belum terdeteksi. Pastikan seluruh sudut papan terlihat dan tidak blur.")
+            return
+        refined = cv2.cornerSubPix(
+            gray, corners, (11, 11), (-1, -1),
+            (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001),
+        )
+        square = self.spin_square.value()
+        obj = np.zeros((pattern[0] * pattern[1], 3), np.float32)
+        obj[:, :2] = np.mgrid[0:pattern[0], 0:pattern[1]].T.reshape(-1, 2) * square
+        self.object_points.append(obj)
+        self.image_points.append(refined)
+        self.image_size = (gray.shape[1], gray.shape[0])
+        count = len(self.object_points)
+        self.btn_compute.setEnabled(count >= 10)
+        self.status.setText(f"Frame checkerboard tersimpan: {count}/10 minimum. Ubah posisi dan kemiringan papan sebelum mengambil lagi.")
+
+    def compute_and_save(self):
+        if len(self.object_points) < 10 or self.image_size is None:
+            return
+        rms, matrix, distortion, _, _ = cv2.calibrateCamera(
+            self.object_points, self.image_points, self.image_size, None, None
+        )
+        path = get_resource_path("camera_intrinsics.json")
+        save_intrinsics(path, matrix, distortion, self.image_size, rms)
+        self.result_intrinsics = load_intrinsics(path)
+        self.status.setText(f"Kalibrasi tersimpan. RMS reprojection error: {rms:.3f} px")
+        self.accept()
+
+
+class QualityCheckDialog(QDialog):
+    """Validate and correct one local marker scale against a physical reference."""
+    def __init__(self, ground_scale, top_scale, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Verifikasi Perpindahan Fisik")
+        self.setMinimumWidth(360)
+        self.setStyleSheet(MODERN_STYLE)
+        self.ground_scale = float(ground_scale)
+        self.top_scale = float(top_scale)
+        self.corrected_ground_scale = None
+        self.corrected_top_scale = None
+        self.validation_result = None
+
+        layout = QVBoxLayout(self)
+        self.lbl_measured = QLabel("Uji satu marker: marker lain harus diam. Masukkan perpindahan marker yang sedang diuji.")
+        self.lbl_measured.setStyleSheet("font-weight: 700; color: #0284c7;")
+        layout.addWidget(self.lbl_measured)
+
+        form = QFormLayout()
+        self.combo_target = QComboBox()
+        self.combo_target.addItem("Ground (ID #0)", "ground")
+        self.combo_target.addItem("Top (ID #1)", "top")
+        self.spin_known = QDoubleSpinBox()
+        self.spin_known.setRange(0.1, 1000.0)
+        self.spin_known.setValue(10.0)
+        self.spin_known.setSuffix(" mm")
+        self.spin_measured = QDoubleSpinBox()
+        self.spin_measured.setRange(-1000.0, 1000.0)
+        self.spin_measured.setDecimals(3)
+        self.spin_measured.setValue(0.0)
+        self.spin_measured.setSuffix(" mm")
+        self.spin_tolerance = QDoubleSpinBox()
+        self.spin_tolerance.setRange(0.1, 25.0)
+        self.spin_tolerance.setValue(5.0)
+        self.spin_tolerance.setSuffix(" %")
+        form.addRow("Marker yang diuji:", self.combo_target)
+        form.addRow("Pergeseran referensi:", self.spin_known)
+        form.addRow("Pembacaan marker aplikasi:", self.spin_measured)
+        form.addRow("Batas galat:", self.spin_tolerance)
+        layout.addLayout(form)
+
+        self.result_label = QLabel("Gunakan ground_x atau top_x dari hasil uji, bukan Delta X, untuk mengoreksi skala lokal.")
+        self.result_label.setWordWrap(True)
+        self.result_label.setStyleSheet("color: #64748b; font-size: 11px;")
+        layout.addWidget(self.result_label)
+
+        buttons = QHBoxLayout()
+        self.btn_check = QPushButton("Periksa")
+        self.btn_check.clicked.connect(self.check)
+        self.btn_apply = QPushButton("Terapkan Koreksi Skala")
+        self.btn_apply.setEnabled(False)
+        self.btn_apply.clicked.connect(self.apply_scale)
+        btn_close = QPushButton("Tutup")
+        btn_close.clicked.connect(self.accept)
+        buttons.addWidget(self.btn_check)
+        buttons.addWidget(self.btn_apply)
+        buttons.addWidget(btn_close)
+        layout.addLayout(buttons)
+
+    def check(self):
+        result = validate_known_displacement(
+            self.spin_known.value(), self.spin_measured.value(), self.spin_tolerance.value()
+        )
+        self.validation_result = result
+        if result["valid"]:
+            self.result_label.setText(f"Lulus. Galat {result['error_pct']:.2f}% atau {result['error_mm']:.2f} mm.")
+            self.result_label.setStyleSheet("color: #059669; font-size: 11px; font-weight: bold;")
+        else:
+            self.result_label.setText(f"Gagal. Galat {result['error_pct']:.2f}% melebihi batas; lakukan kalibrasi ulang.")
+            self.result_label.setStyleSheet("color: #dc2626; font-size: 11px; font-weight: bold;")
+        self.btn_apply.setEnabled(abs(self.spin_measured.value()) > 1e-6)
+
+    def apply_scale(self):
+        measured = abs(self.spin_measured.value())
+        if measured <= 1e-6:
+            return
+        self.check()
+        target = self.combo_target.currentData()
+        current_scale = self.ground_scale if target == "ground" else self.top_scale
+        corrected = current_scale * (self.spin_known.value() / measured)
+        if target == "ground":
+            self.corrected_ground_scale = corrected
+        else:
+            self.corrected_top_scale = corrected
+        self.result_label.setText(
+            f"Skala {target.title()} baru: {corrected:.6f} mm/px. Tekan Tutup untuk menerapkannya."
+        )
+        self.result_label.setStyleSheet("color: #0284c7; font-size: 11px; font-weight: bold;")
 
 
 # =====================================================================
 # DETEKSI KAMERA YANG TERHUBUNG
 # =====================================================================
+def enumerate_connected_camera_names():
+    """Baca nama perangkat kamera aktif dari Windows.
+
+    Mengembalikan list nama perangkat kamera yang terdeteksi oleh Windows,
+    dalam urutan enumerasi DirectShow / WMI yang biasanya sesuai dengan
+    urutan index OpenCV saat menggunakan backend CAP_DSHOW.
+    """
+    if os.name != "nt":
+        return []
+
+    command = (
+        "Get-CimInstance -ClassName Win32_PnPEntity "
+        "-Filter \"PNPClass='Camera' AND ConfigManagerErrorCode=0\" "
+        "| Select-Object -ExpandProperty Name"
+    )
+    run_options = {
+        "capture_output": True,
+        "text": True,
+        "errors": "replace",
+        "timeout": 8,
+    }
+    if hasattr(subprocess, "CREATE_NO_WINDOW"):
+        run_options["creationflags"] = subprocess.CREATE_NO_WINDOW
+
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", command],
+            **run_options,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+
+    names = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    return list(dict.fromkeys(names))
+
+
 def enumerate_cameras():
     """
     Mendeteksi daftar kamera yang terhubung ke sistem.
     Mengembalikan list of (index, name) tuple.
-    Menggunakan WMI (Windows) untuk mendapatkan nama kamera asli.
-    Fallback ke scan OpenCV jika WMI tidak tersedia.
-    """
-    cameras = []
 
-    # Coba ambil nama kamera via WMI (Windows)
-    try:
-        import subprocess
-        result = subprocess.run(
-            ["powershell", "-NoProfile", "-Command",
-             "Get-PnpDevice -Class Camera -Status OK | Select-Object -ExpandProperty FriendlyName"],
-            capture_output=True, text=True, timeout=5,
-            creationflags=subprocess.CREATE_NO_WINDOW
-        )
-        wmi_names = [n.strip() for n in result.stdout.strip().splitlines() if n.strip()]
-    except Exception:
-        wmi_names = []
+    Langkah:
+    1. Query nama perangkat kamera dari Windows (via WMI/PowerShell).
+    2. Scan index OpenCV 0-5 dengan backend DirectShow untuk cek mana
+       yang benar-benar aktif.
+    3. Pasangkan nama Windows dengan index OpenCV berdasarkan urutan
+       enumerasi. Jika jumlah tidak cocok, sisa index diberi nama
+       generik "Kamera (Index N)".
+    """
+    # Ambil nama perangkat kamera dari Windows
+    windows_names = enumerate_connected_camera_names()
 
     # Scan OpenCV untuk cek index mana yang benar-benar aktif
     active_indices = []
     for i in range(6):
         cap = cv2.VideoCapture(i, cv2.CAP_DSHOW)
-        if cap.isOpened():
-            active_indices.append(i)
+        opened = cap.isOpened()
+        if opened:
+            ok, _ = cap.read()
             cap.release()
+            if ok:
+                active_indices.append(i)
 
-    # Gabungkan: pasangkan nama WMI dengan index aktif
-    for i, idx in enumerate(active_indices):
-        if i < len(wmi_names):
-            name = wmi_names[i]
+    # Pasangkan nama Windows dengan index aktif berdasarkan urutan
+    cameras = []
+    for pos, idx in enumerate(active_indices):
+        if pos < len(windows_names):
+            name = windows_names[pos]
         else:
-            name = f"Camera {idx}"
+            name = f"Kamera (Index {idx})"
         cameras.append((idx, name))
 
     # Jika tidak ada kamera aktif sama sekali
     if not cameras:
-        cameras.append((0, "Camera 0 (tidak terdeteksi)"))
+        if windows_names:
+            cameras.append((0, f"{windows_names[0]} (tidak tersedia)"))
+        else:
+            cameras.append((0, "Tidak ada kamera terdeteksi"))
 
     return cameras
+
+
+class CameraScanner(QThread):
+    """Deteksi kamera di thread latar agar antarmuka tetap responsif."""
+    cameras_ready = pyqtSignal(list)  # list of (index, name)
+
+    def run(self):
+        self.cameras_ready.emit(enumerate_cameras())
 
 
 # =====================================================================
@@ -821,6 +1354,7 @@ class VideoWorker(QThread):
     frameReady = pyqtSignal(QImage, np.ndarray, int, float)  # q_img, raw_frame, frame_idx, fps
     newDataPoint = pyqtSignal(float, int, float, float, float, str, bool, bool)  # t, idx, dx, dy, dz, status, g_ok, t_ok
     baselineStatus = pyqtSignal(int, int)  # current, total
+    baselineState = pyqtSignal(str, bool)  # message, baseline locked
     connectionChanged = pyqtSignal(bool, str)
     testFinished = pyqtSignal(dict)
 
@@ -831,18 +1365,41 @@ class VideoWorker(QThread):
         self._stopped_manually = False
         
         self.camera_source = 0
+        self.camera_name = ""
         self.use_dshow = True
         self.resolution_str = ""
 
         self.ground_id = 0
         self.top_id = 1
-        self.pixel_to_mm = 0.265
-        self.baseline_frames_target = 30
+        self.ground_scale_mm_px = 0.265
+        self.top_scale_mm_px = 0.265
+        self.ground_marker_size_mm = 40.0
+        self.top_marker_size_mm = 40.0
+        self.camera_intrinsics = load_intrinsics(get_resource_path("camera_intrinsics.json"))
+        self.use_size_based_z = True
+        self.z_measurement_mode = "top_marker_size"
+
+        self.baseline_frames_target = 60
+        self.baseline_window_s = 2.5
+        self.max_baseline_wait_s = 5.0
+        self.baseline_wait_started_at = None
         self.max_missing_frames = 10
 
         self.baseline_samples = []
         self.baseline_rel = None
         self.baseline_sizes = None
+        self.origin_ground = None   # (gx0, gy0) posisi awal ground — titik nol
+        self.origin_top    = None   # (tx0, ty0) posisi awal top — titik nol
+        self.z_smooth_buffer = deque(maxlen=15)  # rolling average Z (15 frame)
+        self.baseline_result = {"valid": False, "reason": "Baseline belum dimulai."}
+        self.baseline_forced = False
+        self.filtered_x = None
+        self.filtered_y = None
+        self.filter_time = None
+        self.valid_frame_count = 0
+        self.interpolated_frame_count = 0
+        self.missing_frame_count = 0
+        self.fps_samples = []
         self.all_rows = []
         self.t_all = []
         self.x_all = []
@@ -851,21 +1408,43 @@ class VideoWorker(QThread):
         self.frame_idx = 0
         self.t0 = 0.0
 
-    def set_camera(self, source, is_usb=True):
+    def set_camera(self, source, is_usb=True, name=""):
         self.camera_source = source
+        self.camera_name = name
         self.use_dshow = is_usb
 
-    def set_parameters(self, ground_id, top_id, scale, baseline_frames):
+    def set_parameters(self, ground_id, top_id, ground_scale_mm_px, top_scale_mm_px,
+                       baseline_frames, ground_marker_size_mm=40.0, top_marker_size_mm=40.0):
         self.ground_id = ground_id
         self.top_id = top_id
-        self.pixel_to_mm = scale
+        self.ground_scale_mm_px = float(ground_scale_mm_px)
+        self.top_scale_mm_px = float(top_scale_mm_px)
         self.baseline_frames_target = baseline_frames
+        self.ground_marker_size_mm = float(ground_marker_size_mm)
+        self.top_marker_size_mm = float(top_marker_size_mm)
+
+    def set_camera_intrinsics(self, intrinsics):
+        self.camera_intrinsics = intrinsics
+        self.z_measurement_mode = "top_marker_size"
 
     def start_recording(self):
         self.recording = True
         self.baseline_samples = []
         self.baseline_rel = None
         self.baseline_sizes = None
+        self.baseline_result = {"valid": False, "reason": "Baseline belum selesai."}
+        self.baseline_forced = False
+        self.baseline_wait_started_at = None
+        self.filtered_x = None
+        self.filtered_y = None
+        self.filter_time = None
+        self.valid_frame_count = 0
+        self.interpolated_frame_count = 0
+        self.missing_frame_count = 0
+        self.fps_samples = []
+        self.origin_ground = None   # reset origin setiap sesi baru
+        self.origin_top    = None
+        self.z_smooth_buffer = deque(maxlen=15)  # reset buffer smooth Z
         self.all_rows = []
         self.t_all = []
         self.x_all = []
@@ -874,9 +1453,38 @@ class VideoWorker(QThread):
         self.frame_idx = 0
         self.t0 = time.time()
 
+    def _lock_baseline(self, ground_pos, top_pos, forced=False):
+        """Commit the tare reference and allow data acquisition to begin."""
+        samples = np.asarray(self.baseline_samples, dtype=np.float64)
+        if samples.size == 0:
+            return
+
+        if self.baseline_result.get("valid"):
+            rel_x0 = float(self.baseline_result["baseline_x_px"])
+            rel_y0 = float(self.baseline_result["baseline_y_px"])
+        else:
+            rel_x0 = float(np.median(samples[:, 1]))
+            rel_y0 = float(np.median(samples[:, 2]))
+
+        self.baseline_rel = (rel_x0, rel_y0)
+        self.baseline_sizes = (float(np.median(samples[:, 3])), float(np.median(samples[:, 4])))
+
+        self.origin_ground = (ground_pos[0], ground_pos[1])
+        self.origin_top = (top_pos[0], top_pos[1])
+        self.baseline_forced = bool(forced)
+        if forced:
+            self.baselineState.emit("Tare kurang stabil; perekaman dimulai dengan baseline median.", True)
+        else:
+            self.baselineState.emit("Tare stabil. Perekaman dan grafik berjalan.", True)
+
     def stop_recording(self):
         self.recording = False
         try:
+            quality = quality_summary(
+                self.frame_idx, self.valid_frame_count, self.interpolated_frame_count,
+                self.missing_frame_count, self.baseline_result,
+                float(np.mean(self.fps_samples)) if self.fps_samples else 0.0,
+            )
             summary = {
                 "total_frames": self.frame_idx,
                 "t_all": list(self.t_all),
@@ -884,7 +1492,10 @@ class VideoWorker(QThread):
                 "y_all": list(self.y_all),
                 "z_all": list(self.z_all),
                 "all_rows": [list(r) for r in self.all_rows],
-                "pixel_to_mm": self.pixel_to_mm
+                "ground_scale_mm_px": self.ground_scale_mm_px,
+                "top_scale_mm_px": self.top_scale_mm_px,
+                "z_measurement_mode": self.z_measurement_mode,
+                "quality": quality
             }
         except Exception as e:
             print(f"[VideoWorker] Warning snapshot buffer: {e}")
@@ -895,7 +1506,9 @@ class VideoWorker(QThread):
                 "y_all": [],
                 "z_all": [],
                 "all_rows": [],
-                "pixel_to_mm": self.pixel_to_mm
+                "ground_scale_mm_px": self.ground_scale_mm_px,
+                "top_scale_mm_px": self.top_scale_mm_px,
+                "quality": {}
             }
         return summary
 
@@ -968,7 +1581,10 @@ class VideoWorker(QThread):
 
         h_act, w_act = test_frame.shape[:2]
         self.resolution_str = f"{w_act}x{h_act}"
-        self.connectionChanged.emit(True, f"Kamera berhasil terhubung ({self.resolution_str})")
+        cam_label = self.camera_name or f"Index {self.camera_source}"
+        self.connectionChanged.emit(
+            True, f"{cam_label} terhubung ({self.resolution_str})"
+        )
 
         aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
         aruco_params = cv2.aruco.DetectorParameters()
@@ -1005,6 +1621,7 @@ class VideoWorker(QThread):
 
             centers = {}
             sizes = {}
+            marker_corners = {}
             if ids is not None:
                 for i, marker_id in enumerate(ids.flatten()):
                     c = corners[i][0]
@@ -1015,15 +1632,17 @@ class VideoWorker(QThread):
                     d23 = float(np.linalg.norm(c[2] - c[3]))
                     d30 = float(np.linalg.norm(c[3] - c[0]))
                     sizes[int(marker_id)] = (d01 + d12 + d23 + d30) / 4.0
+                    marker_corners[int(marker_id)] = c
 
             ground_pos = centers.get(self.ground_id)
             top_pos = centers.get(self.top_id)
             ground_size = sizes.get(self.ground_id)
             top_size = sizes.get(self.top_id)
+            ground_corners = marker_corners.get(self.ground_id)
+            top_corners = marker_corners.get(self.top_id)
 
             g_detected = ground_pos is not None
             t_detected = top_pos is not None
-
             status = "ok"
             if ground_pos is None or top_pos is None:
                 missing_count += 1
@@ -1034,6 +1653,10 @@ class VideoWorker(QThread):
                 top_size = top_size or last_top_size
             else:
                 missing_count = 0
+
+            # Delta Z active mode uses the apparent marker Top size only.
+            # It is intentionally independent from the unstable PnP pose path.
+            z_status = "top_marker_size"
 
             if ground_pos is not None:
                 last_ground = ground_pos
@@ -1063,48 +1686,99 @@ class VideoWorker(QThread):
             # Logika saat pengujian aktif (Recording)
             if self.recording:
                 now = time.time() - self.t0
-                if ground_pos and top_pos and status != "missing":
+                self.fps_samples.append(current_fps)
+                if status == "ok":
+                    self.valid_frame_count += 1
+                elif status == "interpolated":
+                    self.interpolated_frame_count += 1
+                else:
+                    self.missing_frame_count += 1
+
+                # Interpolated positions are for display continuity only. They
+                # are deliberately excluded from baseline, statistics, and export.
+                if g_detected and t_detected and status == "ok":
                     rel_x = top_pos[0] - ground_pos[0]
                     rel_y = top_pos[1] - ground_pos[1]
 
-                    if len(self.baseline_samples) < self.baseline_frames_target:
-                        self.baseline_samples.append((rel_x, rel_y, ground_size or 50.0, top_size or 50.0))
-                        self.baselineStatus.emit(len(self.baseline_samples), self.baseline_frames_target)
-                        if len(self.baseline_samples) == self.baseline_frames_target:
-                            arr = np.array(self.baseline_samples)
-                            self.baseline_rel = (arr[:, 0].mean(), arr[:, 1].mean())
-                            self.baseline_sizes = (arr[:, 2].mean(), arr[:, 3].mean())
+                    if self.baseline_rel is None:
+                        if self.baseline_wait_started_at is None:
+                            self.baseline_wait_started_at = now
+                        self.baseline_samples.append((now, rel_x, rel_y, ground_size or 50.0, top_size or 50.0))
+                        while self.baseline_samples and now - self.baseline_samples[0][0] > self.baseline_window_s:
+                            self.baseline_samples.pop(0)
+                        baseline_t = [s[0] for s in self.baseline_samples]
+                        baseline_x = [s[1] for s in self.baseline_samples]
+                        baseline_y = [s[2] for s in self.baseline_samples]
+                        self.baseline_result = assess_baseline(
+                            baseline_t, baseline_x, baseline_y,
+                            max(self.ground_scale_mm_px, self.top_scale_mm_px)
+                        )
+                        elapsed = now - self.baseline_wait_started_at
+                        progress_fraction = min(1.0, elapsed / 2.0)
+                        progress = int(progress_fraction * self.baseline_frames_target)
+                        self.baselineStatus.emit(progress, self.baseline_frames_target)
+                        if self.baseline_result["valid"]:
+                            self._lock_baseline(ground_pos, top_pos)
+                        elif elapsed >= self.max_baseline_wait_s:
+                            self._lock_baseline(ground_pos, top_pos, forced=True)
+                        elif elapsed >= 2.0:
+                            self.baselineState.emit("Tare belum stabil; menunggu hingga 5 detik.", False)
 
-                        cv2.putText(frame, f"TARE BASELINE: {len(self.baseline_samples)}/{self.baseline_frames_target} - Diamkan gedung",
+                        cv2.putText(frame, "TARE STABIL: diamkan miniatur selama 2 detik",
                                     (15, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 165, 255), 2)
 
                     elif self.baseline_rel is not None:
-                        disp_x = rel_x - self.baseline_rel[0]
-                        disp_y = rel_y - self.baseline_rel[1]
+                        # Convert Ground and Top with their independent local scales.
+                        if self.origin_ground is not None and self.origin_top is not None:
+                            local_motion = relative_local_displacement(
+                                ground_pos, top_pos, self.origin_ground, self.origin_top,
+                                self.ground_scale_mm_px, self.top_scale_mm_px,
+                            )
+                            g_x = local_motion["ground_x_mm"]
+                            g_y = local_motion["ground_y_mm"]
+                            t_x = local_motion["top_x_mm"]
+                            t_y = local_motion["top_y_mm"]
+                        else:
+                            g_x = g_y = t_x = t_y = 0.0
 
-                        if self.pixel_to_mm:
-                            disp_x *= self.pixel_to_mm
-                            disp_y *= self.pixel_to_mm
+                        # Relative displacement plus a timestamp-aware low-pass filter.
+                        raw_disp_x = t_x - g_x
+                        raw_disp_y = t_y - g_y
+                        dt_s = now - self.filter_time if self.filter_time is not None else 0.0
+                        self.filtered_x = lowpass_step(raw_disp_x, self.filtered_x, dt_s)
+                        self.filtered_y = lowpass_step(raw_disp_y, self.filtered_y, dt_s)
+                        self.filter_time = now
+                        disp_x = self.filtered_x
+                        disp_y = self.filtered_y
 
-                        scale = self.pixel_to_mm if self.pixel_to_mm else 1.0
-                        g_x = ground_pos[0] * scale
-                        g_y = ground_pos[1] * scale
-                        t_x = top_pos[0] * scale
-                        t_y = top_pos[1] * scale
-
-                        # Estimasi kedalaman Out-of-Plane (Sumbu Z)
-                        # Model optik perspektif: Z ~ f * W / size
+                        # A smaller marker means it appears farther from the
+                        # camera; a larger marker means it appears closer. The
+                        # result is a camera-axis / marker-tilt indicator.
+                        _, baseline_top_size = getattr(self, "baseline_sizes", (50.0, 50.0))
                         focal_px = 0.85 * w_act if w_act else 1000.0
-                        z_ref = focal_px * scale
-                        bg_s, bt_s = getattr(self, 'baseline_sizes', (50.0, 50.0))
-                        g_z = z_ref * ((bg_s / max(ground_size or bg_s, 1e-3)) - 1.0)
-                        t_z = z_ref * ((bt_s / max(top_size or bt_s, 1e-3)) - 1.0)
-                        disp_z = t_z - g_z
+                        top_z = estimate_marker_size_depth_change(
+                            baseline_top_size, top_size or baseline_top_size,
+                            self.top_marker_size_mm, focal_px,
+                        )
+                        if top_z is None:
+                            top_z = 0.0
+                        g_z = 0.0
+                        t_z = top_z
+                        disp_z_raw = top_z
+                        self.z_measurement_mode = "top_marker_size"
+
+                        # Keep the existing rolling average for visual stability.
+                        self.z_smooth_buffer.append(disp_z_raw)
+                        disp_z = float(np.mean(self.z_smooth_buffer))
 
                         row_data = [f"{now:.4f}", self.frame_idx,
-                                    f"{g_x:.3f}", f"{g_y:.3f}", f"{g_z:.3f}",
-                                    f"{t_x:.3f}", f"{t_y:.3f}", f"{t_z:.3f}",
-                                    f"{disp_x:.3f}", f"{disp_y:.3f}", f"{disp_z:.3f}", status]
+                                    f"{g_x:.3f}", f"{g_y:.3f}",
+                                    f"{g_z:.3f}" if np.isfinite(g_z) else "",
+                                    f"{t_x:.3f}", f"{t_y:.3f}",
+                                    f"{t_z:.3f}" if np.isfinite(t_z) else "",
+                                    f"{disp_x:.3f}", f"{disp_y:.3f}",
+                                    f"{disp_z:.3f}" if np.isfinite(disp_z) else "",
+                                    status, z_status]
                         self.all_rows.append(row_data)
                         self.t_all.append(now)
                         self.x_all.append(disp_x)
@@ -1113,7 +1787,7 @@ class VideoWorker(QThread):
 
                         self.newDataPoint.emit(now, self.frame_idx, disp_x, disp_y, disp_z, status, g_detected, t_detected)
 
-                        # Tag callout Top Marker dengan nilai live delta X & Z
+                        # Tag callout Top Marker with live lateral motion and Delta Z.
                         tx, ty = int(top_pos[0]), int(top_pos[1])
                         cv2.rectangle(frame, (tx + 12, ty - 14), (tx + 195, ty + 12), (29, 14, 7), -1)
                         cv2.rectangle(frame, (tx + 12, ty - 14), (tx + 195, ty + 12), (252, 132, 192), 1)
@@ -1157,7 +1831,9 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("ShakeLab — Miniature Building Vibration Analysis")
         self.resize(1360, 850)
-        self.setMinimumSize(1150, 720)
+        # Jangan memaksa lebar desktop besar. Pada layar/laptop yang sempit
+        # layout akan berubah menjadi susunan vertikal melalui resizeEvent().
+        self.setMinimumSize(760, 620)
         self.setStyleSheet(MODERN_STYLE)
 
         # Ikon jendela (title bar & taskbar) — ganti "logo.png" dengan nama file logo kamu
@@ -1174,6 +1850,9 @@ class MainWindow(QMainWindow):
         self.x_buffer = deque()
         self.y_buffer = deque()
         self.z_buffer = deque()
+        self.frequency_window_sec = 20.0
+        self.frequency_time_buffer = deque()
+        self.frequency_x_buffer = deque()
 
         # Statistik sementara
         self.max_x = 0.0
@@ -1193,8 +1872,16 @@ class MainWindow(QMainWindow):
         self.last_saved_excel = ""
         self.last_saved_csv = ""
         self.last_saved_png = ""
+        self.last_valid_disp_x = None
+        self.last_scale_validation = None
+        self.ground_marker_size_mm = 40.0
+        self.top_marker_size_mm = 40.0
+        self.camera_scanner = None
 
         self.setup_ui()
+        # Terapkan juga saat aplikasi pertama kali tampil; resizeEvent dapat
+        # terjadi sebelum seluruh widget dibuat pada beberapa window manager.
+        QTimer.singleShot(0, self._apply_responsive_layout)
 
     def setup_ui(self):
         central_widget = QWidget()
@@ -1251,6 +1938,7 @@ class MainWindow(QMainWindow):
         lbl_subtitle = QLabel("Miniature Building Vibration & Displacement Analysis")
         lbl_subtitle.setStyleSheet("font-size: 11px; color: #64748b;")
         title_box.addWidget(lbl_subtitle)
+        self.lbl_header_subtitle = lbl_subtitle
         header_layout.addLayout(title_box)
 
         header_layout.addStretch()
@@ -1280,11 +1968,20 @@ class MainWindow(QMainWindow):
         body_widget = QWidget()
         body_layout = QHBoxLayout(body_widget)
         body_layout.setContentsMargins(14, 14, 14, 14)
-        body_layout.setSpacing(14)
+        body_layout.setSpacing(0)
+
+        # Splitter membuat lebar sidebar dapat disesuaikan dan mencegah area
+        # kerja keluar dari layar ketika aplikasi dibuka di resolusi kecil.
+        self.content_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.content_splitter.setChildrenCollapsible(False)
+        self.content_splitter.setHandleWidth(8)
+        body_layout.addWidget(self.content_splitter)
 
         # ── LEFT SIDEBAR (Controls & Settings) ──
         sidebar_scroll = QScrollArea()
-        sidebar_scroll.setFixedWidth(340)
+        self.sidebar_scroll = sidebar_scroll
+        sidebar_scroll.setMinimumWidth(270)
+        sidebar_scroll.setMaximumWidth(390)
         sidebar_scroll.setWidgetResizable(True)
         sidebar_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
 
@@ -1322,9 +2019,11 @@ class MainWindow(QMainWindow):
         seg_box.setContentsMargins(2, 2, 2, 2)
         seg_box.setSpacing(4)
 
-        self.btn_seg_usb = QPushButton("USB Webcam")
+        self.btn_seg_usb = QPushButton("USB")
+        self.btn_seg_usb.setToolTip("Gunakan webcam USB")
         self.btn_seg_usb.setObjectName("btnSegmentActive")
-        self.btn_seg_ip = QPushButton("IP / Wi-Fi")
+        self.btn_seg_ip = QPushButton("IP")
+        self.btn_seg_ip.setToolTip("Gunakan IP camera melalui Wi-Fi")
         self.btn_seg_ip.setObjectName("btnSegmentInactive")
 
         self.btn_seg_usb.clicked.connect(lambda: self.switch_cam_mode(True))
@@ -1400,9 +2099,6 @@ class MainWindow(QMainWindow):
         lbl_marker_title.setStyleSheet("font-weight: 700; font-size: 11px; color: #0f172a; letter-spacing: 0.5px;")
         head_marker.addWidget(lbl_marker_title)
         head_marker.addStretch()
-        lbl_dict = QLabel("ArUco 4x4")
-        lbl_dict.setStyleSheet("color: #64748b; font-size: 10px; font-family: 'JetBrains Mono';")
-        head_marker.addWidget(lbl_dict)
         lay_card_marker.addLayout(head_marker)
 
         # Ground Marker Card (#0)
@@ -1423,10 +2119,9 @@ class MainWindow(QMainWindow):
         lbl_m0_sub = QLabel("Shaking table platform")
         lbl_m0_sub.setStyleSheet("font-size: 10px; color: #64748b;")
         txt_m0.addWidget(lbl_m0_sub)
-        lay_m0.addLayout(txt_m0)
-        lay_m0.addStretch()
-        self.badge_m0_status = QLabel("Standby")
-        self.badge_m0_status.setStyleSheet("background-color: #f0fdf4; color: #16a34a; border: 1px solid #bbf7d0; border-radius: 10px; padding: 2px 7px; font-size: 9px; font-weight: 600; font-family: 'JetBrains Mono';")
+        lay_m0.addLayout(txt_m0, stretch=1)
+        self.badge_m0_status = QLabel("● OK")
+        self.badge_m0_status.setStyleSheet("color: #059669; font-weight: bold; font-size: 11px;")
         lay_m0.addWidget(self.badge_m0_status)
         lay_card_marker.addWidget(card_m0)
 
@@ -1438,20 +2133,19 @@ class MainWindow(QMainWindow):
         lbl_id1 = QLabel("#1")
         lbl_id1.setFixedSize(28, 28)
         lbl_id1.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        lbl_id1.setStyleSheet("background-color: #faf5ff; color: #9333ea; font-weight: bold; font-family: 'JetBrains Mono'; border-radius: 6px;")
+        lbl_id1.setStyleSheet("background-color: #fdf2f8; color: #db2777; font-weight: bold; font-family: 'JetBrains Mono'; border-radius: 6px;")
         lay_m1.addWidget(lbl_id1)
         txt_m1 = QVBoxLayout()
         txt_m1.setSpacing(1)
-        lbl_m1_name = QLabel("Roof Target")
+        lbl_m1_name = QLabel("Top Target")
         lbl_m1_name.setStyleSheet("font-weight: 600; font-size: 11px; color: #0f172a;")
         txt_m1.addWidget(lbl_m1_name)
-        lbl_m1_sub = QLabel("Top story apex node")
+        lbl_m1_sub = QLabel("Miniature top floor")
         lbl_m1_sub.setStyleSheet("font-size: 10px; color: #64748b;")
         txt_m1.addWidget(lbl_m1_sub)
-        lay_m1.addLayout(txt_m1)
-        lay_m1.addStretch()
-        self.badge_m1_status = QLabel("Standby")
-        self.badge_m1_status.setStyleSheet("background-color: #faf5ff; color: #9333ea; border: 1px solid #e9d5ff; border-radius: 10px; padding: 2px 7px; font-size: 9px; font-weight: 600; font-family: 'JetBrains Mono';")
+        lay_m1.addLayout(txt_m1, stretch=1)
+        self.badge_m1_status = QLabel("● OK")
+        self.badge_m1_status.setStyleSheet("color: #059669; font-weight: bold; font-size: 11px;")
         lay_m1.addWidget(self.badge_m1_status)
         lay_card_marker.addWidget(card_m1)
 
@@ -1471,28 +2165,66 @@ class MainWindow(QMainWindow):
         lbl_calib_title.setStyleSheet("font-weight: 700; font-size: 11px; color: #0f172a; letter-spacing: 0.5px;")
         head_calib.addWidget(lbl_calib_title)
         head_calib.addStretch()
-        self.lbl_calib_verified = QLabel("● Verified")
-        self.lbl_calib_verified.setStyleSheet("color: #059669; font-size: 11px; font-weight: 600;")
-        head_calib.addWidget(self.lbl_calib_verified)
         lay_card_calib.addLayout(head_calib)
 
-        row_scale_input = QHBoxLayout()
-        row_scale_input.setSpacing(6)
-        self.spin_scale = QDoubleSpinBox()
-        self.spin_scale.setDecimals(6)
-        self.spin_scale.setRange(0.0001, 10.0)
-        self.spin_scale.setValue(0.265000)
-        self.spin_scale.setSingleStep(0.005)
-        self.spin_scale.setSuffix(" mm/px")
-        self.spin_scale.setMinimumHeight(32)
-        row_scale_input.addWidget(self.spin_scale, stretch=3)
+        row_scale_input = QVBoxLayout()
+        row_scale_input.setSpacing(5)
+        self.spin_ground_scale = QDoubleSpinBox()
+        self.spin_ground_scale.setDecimals(6)
+        self.spin_ground_scale.setRange(0.0001, 10.0)
+        self.spin_ground_scale.setValue(0.265000)
+        self.spin_ground_scale.setSingleStep(0.005)
+        self.spin_ground_scale.setPrefix("Ground: ")
+        self.spin_ground_scale.setSuffix(" mm/px")
+        self.spin_ground_scale.setMinimumHeight(32)
+        self.spin_ground_scale.setToolTip("Skala lokal marker Ground ID #0")
+        row_scale_input.addWidget(self.spin_ground_scale)
+
+        self.spin_top_scale = QDoubleSpinBox()
+        self.spin_top_scale.setDecimals(6)
+        self.spin_top_scale.setRange(0.0001, 10.0)
+        self.spin_top_scale.setValue(0.265000)
+        self.spin_top_scale.setSingleStep(0.005)
+        self.spin_top_scale.setPrefix("Top: ")
+        self.spin_top_scale.setSuffix(" mm/px")
+        self.spin_top_scale.setMinimumHeight(32)
+        self.spin_top_scale.setToolTip("Skala lokal marker Top ID #1")
+        row_scale_input.addWidget(self.spin_top_scale)
 
         self.btn_calib = QPushButton("Kalibrasi")
         self.btn_calib.setMinimumHeight(32)
         self.btn_calib.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_calib.clicked.connect(self.open_calibration_dialog)
-        row_scale_input.addWidget(self.btn_calib, stretch=2)
+        row_scale_input.addWidget(self.btn_calib)
         lay_card_calib.addLayout(row_scale_input)
+
+        row_structure_height = QHBoxLayout()
+        lbl_structure_height = QLabel("Tinggi Miniatur:")
+        lbl_structure_height.setStyleSheet("color: #64748b; font-size: 11px;")
+        row_structure_height.addWidget(lbl_structure_height)
+        self.spin_structure_height = QDoubleSpinBox()
+        self.spin_structure_height.setDecimals(1)
+        self.spin_structure_height.setRange(10.0, 5000.0)
+        self.spin_structure_height.setValue(350.0)
+        self.spin_structure_height.setSingleStep(10.0)
+        self.spin_structure_height.setSuffix(" mm")
+        self.spin_structure_height.setToolTip("Jarak fisik dari marker ground ke marker top untuk menghitung drift ratio")
+        self.spin_structure_height.setMinimumHeight(30)
+        row_structure_height.addWidget(self.spin_structure_height, stretch=1)
+        lay_card_calib.addLayout(row_structure_height)
+
+        self.btn_validate_scale = QPushButton("Uji Fisik Skala Lokal")
+        self.btn_validate_scale.setToolTip("Uji Ground atau Top secara terpisah untuk memeriksa skala lokal")
+        self.btn_validate_scale.clicked.connect(self.open_quality_check_dialog)
+        lay_card_calib.addWidget(self.btn_validate_scale)
+        self.lbl_validation_status = QLabel("Verifikasi fisik belum dilakukan")
+        self.lbl_validation_status.setStyleSheet("color: #64748b; font-size: 10px;")
+        lay_card_calib.addWidget(self.lbl_validation_status)
+
+        self.btn_camera_calibration = QPushButton("Kalibrasi Kamera 3D (Opsional)")
+        self.btn_camera_calibration.setToolTip("Simpan parameter checkerboard; Delta Z aktif memakai ukuran marker Top.")
+        self.btn_camera_calibration.clicked.connect(self.open_camera_calibration_dialog)
+        lay_card_calib.addWidget(self.btn_camera_calibration)
 
         sidebar_layout.addWidget(card_calib)
 
@@ -1516,8 +2248,8 @@ class MainWindow(QMainWindow):
         lay_card_exp.addLayout(head_exp)
 
         # Tombol Start & Stop
-        grid_btns = QHBoxLayout()
-        grid_btns.setSpacing(8)
+        grid_btns = QVBoxLayout()
+        grid_btns.setSpacing(6)
 
         self.btn_start = QPushButton("Start / Resume")
         self.btn_start.setObjectName("btnStart")
@@ -1534,20 +2266,27 @@ class MainWindow(QMainWindow):
         grid_btns.addWidget(self.btn_stop)
         lay_card_exp.addLayout(grid_btns)
 
-        # Baseline Tare Filter Progress
-        row_tare = QHBoxLayout()
+        # Baseline Tare Filter Progress. Status dipisahkan dari judul karena
+        # saat rekam pesannya dapat panjang; satu baris horizontal akan memaksa
+        # sidebar melebar dan membuat layout terpotong pada jendela sempit.
+        tare_status_layout = QVBoxLayout()
+        tare_status_layout.setSpacing(2)
         lbl_tare = QLabel("Baseline Tare Filter")
         lbl_tare.setStyleSheet("font-size: 11px; color: #64748b;")
-        row_tare.addWidget(lbl_tare)
-        row_tare.addStretch()
+        tare_status_layout.addWidget(lbl_tare)
         self.lbl_tare_percent = QLabel("100% Ready")
+        self.lbl_tare_percent.setWordWrap(True)
+        self.lbl_tare_percent.setMinimumWidth(0)
+        self.lbl_tare_percent.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred
+        )
         self.lbl_tare_percent.setStyleSheet("font-family: 'JetBrains Mono'; font-size: 11px; color: #059669; font-weight: bold;")
-        row_tare.addWidget(self.lbl_tare_percent)
-        lay_card_exp.addLayout(row_tare)
+        tare_status_layout.addWidget(self.lbl_tare_percent)
+        lay_card_exp.addLayout(tare_status_layout)
 
         self.prog_baseline = QProgressBar()
-        self.prog_baseline.setRange(0, 30)
-        self.prog_baseline.setValue(30)
+        self.prog_baseline.setRange(0, 60)
+        self.prog_baseline.setValue(60)
         self.prog_baseline.setTextVisible(False)
         lay_card_exp.addWidget(self.prog_baseline)
 
@@ -1586,10 +2325,13 @@ class MainWindow(QMainWindow):
 
         sidebar_layout.addStretch()
         sidebar_scroll.setWidget(sidebar_inner)
-        body_layout.addWidget(sidebar_scroll)
+        self.content_splitter.addWidget(sidebar_scroll)
 
         # ── RIGHT WORKSPACE (Live Video + Realtime Scope + Hero Metrics) ──
         workspace = QWidget()
+        self.workspace = workspace
+        workspace.setMinimumWidth(420)
+        workspace.setMinimumHeight(690)
         workspace_layout = QVBoxLayout(workspace)
         workspace_layout.setContentsMargins(0, 0, 0, 0)
         workspace_layout.setSpacing(12)
@@ -1618,10 +2360,6 @@ class MainWindow(QMainWindow):
         self.lbl_feed_frame.setStyleSheet("font-family: 'JetBrains Mono'; font-size: 11px; color: #64748b;")
         fh_layout.addWidget(self.lbl_feed_frame)
 
-        self.lbl_feed_res = QLabel("Resolution: 720p")
-        self.lbl_feed_res.setStyleSheet("font-family: 'JetBrains Mono'; font-size: 11px; color: #64748b;")
-        fh_layout.addWidget(self.lbl_feed_res)
-
         self.badge_tracking_status = QLabel("● Tracking Stable")
         self.badge_tracking_status.setStyleSheet(
             "background-color: #ecfdf5; color: #059669; "
@@ -1643,6 +2381,7 @@ class MainWindow(QMainWindow):
 
         # ── BOTTOM HALF: 2-COLUMN SPLIT (SCOPE GRAPH + HERO METRICS) ──
         bottom_split = QHBoxLayout()
+        self.bottom_split = bottom_split
         bottom_split.setSpacing(12)
 
         # LEFT (COL SPAN 7): DISPLACEMENT GRAPH SCOPE
@@ -1675,7 +2414,7 @@ class MainWindow(QMainWindow):
         leg_y.setStyleSheet("background-color: #faf5ff; color: #9333ea; border: 1px solid #e9d5ff; border-radius: 6px; padding: 3px 8px; font-weight: 600; font-family: 'JetBrains Mono'; font-size: 10px;")
         scope_head.addWidget(leg_y)
 
-        leg_z = QLabel("— ΔZ (Out-of-Plane)")
+        leg_z = QLabel("— ΔZ (Skala Marker Top)")
         leg_z.setStyleSheet("background-color: #fff7ed; color: #ea580c; border: 1px solid #ffedd5; border-radius: 6px; padding: 3px 8px; font-weight: 600; font-family: 'JetBrains Mono'; font-size: 10px;")
         scope_head.addWidget(leg_z)
 
@@ -1697,7 +2436,7 @@ class MainWindow(QMainWindow):
         # Kurva X (Deep Sky Blue), Kurva Y (Purple), Kurva Z (Amber-Orange)
         self.curve_x = self.plot_widget.plot(pen=pg.mkPen(color='#0284c7', width=2.5), name="ΔX (Lateral)")
         self.curve_y = self.plot_widget.plot(pen=pg.mkPen(color='#9333ea', width=2.0), name="ΔY (Axial)")
-        self.curve_z = self.plot_widget.plot(pen=pg.mkPen(color='#ea580c', width=2.0), name="ΔZ (Out-of-Plane)")
+        self.curve_z = self.plot_widget.plot(pen=pg.mkPen(color='#ea580c', width=2.0), name="ΔZ (Skala Marker Top)")
 
         scope_layout.addWidget(self.plot_widget, stretch=1)
 
@@ -1717,6 +2456,7 @@ class MainWindow(QMainWindow):
 
         # RIGHT (COL SPAN 5): HERO MEASUREMENTS, STATS & ACTIONS
         stats_col = QVBoxLayout()
+        self.stats_col = stats_col
         stats_col.setSpacing(8)
 
         # Metric 1: Lateral Sway (ΔX)
@@ -1783,7 +2523,7 @@ class MainWindow(QMainWindow):
         lay_drop.addWidget(self.lbl_drop_limits)
         stats_col.addWidget(card_drop)
 
-        # Metric 3: Out-of-Plane Motion (ΔZ)
+        # Metric 3: Relative height change derived from camera depth.
         card_depth = QFrame()
         card_depth.setObjectName("metricCard")
         lay_depth = QVBoxLayout(card_depth)
@@ -1791,7 +2531,7 @@ class MainWindow(QMainWindow):
         lay_depth.setSpacing(3)
 
         head_depth = QHBoxLayout()
-        lbl_depth_t = QLabel("OUT-OF-PLANE (ΔZ)")
+        lbl_depth_t = QLabel("TOP MARKER Z (ΔZ)")
         lbl_depth_t.setStyleSheet("font-size: 10px; font-weight: 700; color: #64748b; letter-spacing: 0.5px;")
         head_depth.addWidget(lbl_depth_t)
         head_depth.addStretch()
@@ -1813,6 +2553,9 @@ class MainWindow(QMainWindow):
         self.lbl_depth_limits = QLabel("Max: +0.00 mm  |  Min: -0.00 mm")
         self.lbl_depth_limits.setStyleSheet("color: #64748b; font-family: 'JetBrains Mono'; font-size: 11px; border-top: 1px solid #e2e8f0; padding-top: 3px;")
         lay_depth.addWidget(self.lbl_depth_limits)
+        self.lbl_final_height = QLabel("Indikator kedalaman/kemiringan Top")
+        self.lbl_final_height.setStyleSheet("color: #64748b; font-family: 'JetBrains Mono'; font-size: 11px;")
+        lay_depth.addWidget(self.lbl_final_height)
         stats_col.addWidget(card_depth)
 
         # Dual Summary Badges: Drift Ratio & Natural Frequency
@@ -1876,7 +2619,16 @@ class MainWindow(QMainWindow):
         bottom_split.addLayout(stats_col, stretch=5)
         workspace_layout.addLayout(bottom_split, stretch=3)
 
-        body_layout.addWidget(workspace)
+        workspace_scroll = QScrollArea()
+        self.workspace_scroll = workspace_scroll
+        workspace_scroll.setWidgetResizable(True)
+        workspace_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        workspace_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        workspace_scroll.setWidget(workspace)
+        self.content_splitter.addWidget(workspace_scroll)
+        self.content_splitter.setStretchFactor(0, 0)
+        self.content_splitter.setStretchFactor(1, 1)
+        self.content_splitter.setSizes([340, 1000])
         root_layout.addWidget(body_widget)
 
         # ── 3. BOTTOM FOOTER STATUS BAR ──────────────────────────────
@@ -1896,19 +2648,22 @@ class MainWindow(QMainWindow):
         self.lbl_ft_cam.setStyleSheet("color: #64748b; font-family: 'JetBrains Mono'; font-size: 11px;")
         footer_layout.addWidget(self.lbl_ft_cam)
 
-        footer_layout.addWidget(make_sep())
+        footer_sep_cam = make_sep()
+        footer_layout.addWidget(footer_sep_cam)
 
         self.lbl_ft_tracking = QLabel("Tracking: 0.0%")
         self.lbl_ft_tracking.setStyleSheet("color: #0284c7; font-family: 'JetBrains Mono'; font-size: 11px; font-weight: 600;")
         footer_layout.addWidget(self.lbl_ft_tracking)
 
-        footer_layout.addWidget(make_sep())
+        footer_sep_tracking = make_sep()
+        footer_layout.addWidget(footer_sep_tracking)
 
         self.lbl_ft_markers = QLabel("Markers: 0/2 Locked")
         self.lbl_ft_markers.setStyleSheet("color: #0f172a; font-family: 'JetBrains Mono'; font-size: 11px;")
         footer_layout.addWidget(self.lbl_ft_markers)
 
-        footer_layout.addWidget(make_sep())
+        footer_sep_markers = make_sep()
+        footer_layout.addWidget(footer_sep_markers)
 
         # Storage Free space
         try:
@@ -1920,17 +2675,88 @@ class MainWindow(QMainWindow):
         lbl_ft_storage.setStyleSheet("color: #64748b; font-family: 'JetBrains Mono'; font-size: 11px;")
         footer_layout.addWidget(lbl_ft_storage)
 
-        footer_layout.addStretch()
-
-        self.lbl_ft_sync = QLabel("● Sync OK")
-        self.lbl_ft_sync.setStyleSheet("color: #059669; font-family: 'JetBrains Mono'; font-size: 11px;")
-        footer_layout.addWidget(self.lbl_ft_sync)
-
-        self.lbl_ft_lat = QLabel("Latency: 3.2ms")
-        self.lbl_ft_lat.setStyleSheet("color: #64748b; font-family: 'JetBrains Mono'; font-size: 11px;")
-        footer_layout.addWidget(self.lbl_ft_lat)
+        # Elemen status tambahan disembunyikan pada lebar kecil agar footer
+        # tidak terpotong; informasi utama kamera dan tracking tetap terlihat.
+        self._footer_optional_widgets = [
+            footer_sep_tracking, self.lbl_ft_markers, footer_sep_markers, lbl_ft_storage
+        ]
 
         root_layout.addWidget(footer)
+
+    def resizeEvent(self, event):
+        """Sesuaikan tata letak untuk layar sempit tanpa memotong konten."""
+        super().resizeEvent(event)
+        self._apply_responsive_layout()
+        # Geometri splitter dapat berubah satu siklus layout setelah resizeEvent.
+        # Evaluasi ulang agar layar berskala DPI tinggi tidak tertinggal pada
+        # susunan desktop yang terlalu sempit.
+        QTimer.singleShot(0, self._apply_responsive_layout)
+
+    def _apply_responsive_layout(self):
+        """Terapkan breakpoint layout setelah semua widget tersedia."""
+        if not hasattr(self, "content_splitter"):
+            return
+
+        # Lebar jendela saja tidak cukup pada Windows dengan display scaling:
+        # yang menentukan apakah dua panel masih layak berdampingan adalah
+        # lebar area splitter dan ruang kerja yang benar-benar tersedia.
+        splitter_width = self.content_splitter.width() or self.width()
+        workspace_width = self.workspace_scroll.width()
+        workspace_is_cramped = (
+            self.content_splitter.orientation() == Qt.Orientation.Horizontal
+            and workspace_width > 0
+            and workspace_width < 720
+        )
+        compact = (
+            self.width() < 1250
+            or splitter_width < 1180
+            or workspace_is_cramped
+        )
+        target_orientation = (
+            Qt.Orientation.Vertical if compact else Qt.Orientation.Horizontal
+        )
+        if self.content_splitter.orientation() != target_orientation:
+            self.content_splitter.setOrientation(target_orientation)
+
+        if compact:
+            # Kontrol tampil penuh di atas; kanvas/grafik tetap memakai lebar layar.
+            self.sidebar_scroll.setMinimumWidth(0)
+            self.sidebar_scroll.setMaximumWidth(16777215)
+            self.sidebar_scroll.setMinimumHeight(300)
+            self.sidebar_scroll.setMaximumHeight(460)
+            self.content_splitter.setSizes([430, max(300, self.height() - 570)])
+        else:
+            self.sidebar_scroll.setMinimumWidth(270)
+            self.sidebar_scroll.setMaximumWidth(390)
+            self.sidebar_scroll.setMinimumHeight(0)
+            self.sidebar_scroll.setMaximumHeight(16777215)
+            self.content_splitter.setSizes([340, max(500, self.width() - 390)])
+
+        narrow = self.width() < 820
+        self.lbl_header_subtitle.setVisible(not narrow)
+        self.pill_cam.setVisible(not narrow)
+        self.pill_run.setVisible(not narrow)
+        for widget in self._footer_optional_widgets:
+            widget.setVisible(not narrow)
+
+        # At narrow widths, preserve readable chart and metric cards by stacking
+        # the two lower regions instead of squeezing them into two columns.
+        # Pada mode compact, gunakan lebar workspace aktual agar grafik dan
+        # kartu metrik tidak saling menyempit atau terpotong.
+        workspace_width = self.workspace_scroll.width()
+        stack_bottom = compact or workspace_width < 920
+        direction = (
+            QBoxLayout.Direction.TopToBottom if stack_bottom
+            else QBoxLayout.Direction.LeftToRight
+        )
+        if self.bottom_split.direction() != direction:
+            self.bottom_split.setDirection(direction)
+        if stack_bottom:
+            self.bottom_split.setStretch(0, 5)
+            self.bottom_split.setStretch(1, 3)
+        else:
+            self.bottom_split.setStretch(0, 7)
+            self.bottom_split.setStretch(1, 5)
 
     def switch_cam_mode(self, is_usb):
         if is_usb:
@@ -1947,26 +2773,56 @@ class MainWindow(QMainWindow):
         self.btn_seg_ip.setStyle(self.btn_seg_ip.style())
 
     # ── DETEKSI & PEMILIHAN KAMERA ────────────────────────────────
-    def _populate_camera_combo(self):
+    def _populate_camera_combo(self, selected_index=None):
         """Isi ComboBox kamera dengan nama perangkat yang terdeteksi."""
+        if selected_index is None:
+            selected_index = self.combo_cam.currentData()
         self._camera_list = enumerate_cameras()
         self.combo_cam.blockSignals(True)
         self.combo_cam.clear()
         for idx, name in self._camera_list:
-            self.combo_cam.addItem(f"[{idx}] {name}", userData=idx)
+            self.combo_cam.addItem(name, userData=idx)
+        for item_index in range(self.combo_cam.count()):
+            if self.combo_cam.itemData(item_index) == selected_index:
+                self.combo_cam.setCurrentIndex(item_index)
+                break
         self.combo_cam.blockSignals(False)
 
     def _refresh_cameras(self):
-        """Pindai ulang kamera yang terhubung dan perbarui ComboBox."""
+        """Pindai ulang kamera yang terhubung di thread latar dan perbarui ComboBox."""
+        if self.camera_scanner is not None and self.camera_scanner.isRunning():
+            return
+
         self.btn_refresh_cam.setEnabled(False)
         self.btn_refresh_cam.setText("...")
         prev_data = self.combo_cam.currentData()
-        self._populate_camera_combo()
-        # Coba pertahankan pilihan sebelumnya
-        for i in range(self.combo_cam.count()):
-            if self.combo_cam.itemData(i) == prev_data:
-                self.combo_cam.setCurrentIndex(i)
+
+        scanner = CameraScanner()
+        self.camera_scanner = scanner
+        scanner.cameras_ready.connect(
+            lambda cameras, sel=prev_data: self._on_cameras_scanned(cameras, sel)
+        )
+        scanner.finished.connect(lambda: self._finish_camera_scan(scanner))
+        scanner.finished.connect(scanner.deleteLater)
+        scanner.start()
+
+    def _on_cameras_scanned(self, cameras, selected_index):
+        """Terima hasil scan kamera dari thread latar dan perbarui ComboBox."""
+        self._camera_list = cameras
+        self.combo_cam.blockSignals(True)
+        self.combo_cam.clear()
+        for idx, name in self._camera_list:
+            self.combo_cam.addItem(name, userData=idx)
+        for item_index in range(self.combo_cam.count()):
+            if self.combo_cam.itemData(item_index) == selected_index:
+                self.combo_cam.setCurrentIndex(item_index)
                 break
+        self.combo_cam.blockSignals(False)
+
+    def _finish_camera_scan(self, scanner):
+        """Aktifkan kembali tombol setelah pemindaian kamera selesai."""
+        if self.camera_scanner is scanner:
+            self.camera_scanner = None
         self.btn_refresh_cam.setEnabled(True)
         self.btn_refresh_cam.setText("↺")
 
@@ -2004,8 +2860,9 @@ class MainWindow(QMainWindow):
         else:
             is_usb = (self.btn_seg_usb.objectName() == "btnSegmentActive")
             if is_usb:
-                cam_idx = self.combo_cam.currentIndex()
-                source = self._camera_list[cam_idx][0] if cam_idx < len(self._camera_list) else 0
+                source = self.combo_cam.currentData()
+                if not isinstance(source, int):
+                    source = 0
             else:
                 source = self.txt_ip_url.text().strip()
 
@@ -2040,16 +2897,21 @@ class MainWindow(QMainWindow):
             self.btn_connect.setText("Menghubungkan...")
 
             self.worker = VideoWorker()
-            self.worker.set_camera(source, is_usb)
+            cam_name = self.combo_cam.currentText() if is_usb else source
+            self.worker.set_camera(source, is_usb, name=cam_name)
             self.worker.set_parameters(
                 ground_id=0,
                 top_id=1,
-                scale=self.spin_scale.value(),
-                baseline_frames=30
+                ground_scale_mm_px=self.spin_ground_scale.value(),
+                top_scale_mm_px=self.spin_top_scale.value(),
+                baseline_frames=60,
+                ground_marker_size_mm=self.ground_marker_size_mm,
+                top_marker_size_mm=self.top_marker_size_mm,
             )
             self.worker.frameReady.connect(self.on_frame_ready)
             self.worker.newDataPoint.connect(self.on_new_data_point)
             self.worker.baselineStatus.connect(self.on_baseline_progress)
+            self.worker.baselineState.connect(self.on_baseline_state)
             self.worker.connectionChanged.connect(self.on_connection_changed)
             self.worker.start()
 
@@ -2106,7 +2968,44 @@ class MainWindow(QMainWindow):
             )
             self.lbl_video.setPixmap(scaled_pixmap)
 
+        # Meneruskan live frame ke dialog kalibrasi agar preview video tetap bergerak aktif (tidak freeze)
+        if getattr(self, 'calib_dialog', None) is not None and self.calib_dialog.isVisible():
+            self.calib_dialog.update_live_frame(raw_frame)
+        if getattr(self, 'camera_calib_dialog', None) is not None and self.camera_calib_dialog.isVisible():
+            self.camera_calib_dialog.update_live_frame(raw_frame)
+
     # ── KALIBRASI ────────────────────────────────────────────────
+    def open_quality_check_dialog(self):
+        dialog = QualityCheckDialog(
+            self.spin_ground_scale.value(), self.spin_top_scale.value(), self
+        )
+        dialog.exec()
+        result = dialog.validation_result
+        if result is None:
+            return
+        result["reference_displacement_mm"] = dialog.spin_known.value()
+        result["measured_displacement_mm"] = dialog.spin_measured.value()
+        result["target_marker"] = dialog.combo_target.currentData()
+        self.last_scale_validation = result
+        if dialog.corrected_ground_scale is not None:
+            self.spin_ground_scale.setValue(dialog.corrected_ground_scale)
+            if self.worker:
+                self.worker.ground_scale_mm_px = dialog.corrected_ground_scale
+        if dialog.corrected_top_scale is not None:
+            self.spin_top_scale.setValue(dialog.corrected_top_scale)
+            if self.worker:
+                self.worker.top_scale_mm_px = dialog.corrected_top_scale
+        if result["valid"]:
+            self.lbl_validation_status.setText(
+                f"Lulus: galat {result['error_pct']:.2f}% ({result['error_mm']:.2f} mm)"
+            )
+            self.lbl_validation_status.setStyleSheet("color: #059669; font-size: 10px; font-weight: bold;")
+        else:
+            self.lbl_validation_status.setText(
+                f"Gagal: galat {result['error_pct']:.2f}% - kalibrasi ulang diperlukan"
+            )
+            self.lbl_validation_status.setStyleSheet("color: #dc2626; font-size: 10px; font-weight: bold;")
+
     def open_calibration_dialog(self):
         if self.latest_raw_frame is None:
             QMessageBox.information(
@@ -2115,18 +3014,45 @@ class MainWindow(QMainWindow):
             )
             return
 
-        dlg = CalibrationDialog(self.latest_raw_frame, self.spin_scale.value(), self)
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            new_scale = dlg.calculated_scale
-            self.spin_scale.setValue(new_scale)
+        self.calib_dialog = CalibrationDialog(
+            self.latest_raw_frame,
+            self.spin_ground_scale.value(), self.spin_top_scale.value(),
+            self.ground_marker_size_mm, self.top_marker_size_mm, self,
+        )
+        if self.calib_dialog.exec() == QDialog.DialogCode.Accepted:
+            ground_scale = self.calib_dialog.ground_scale_mm_px
+            top_scale = self.calib_dialog.top_scale_mm_px
+            self.spin_ground_scale.setValue(ground_scale)
+            self.spin_top_scale.setValue(top_scale)
+            self.ground_marker_size_mm = self.calib_dialog.spin_ground_marker_mm.value()
+            self.top_marker_size_mm = self.calib_dialog.spin_top_marker_mm.value()
             if self.worker:
-                self.worker.pixel_to_mm = new_scale
-            self.lbl_calib_verified.setText("● Verified")
-            self.lbl_calib_verified.setStyleSheet("color: #059669; font-size: 11px; font-weight: 600;")
+                self.worker.ground_scale_mm_px = ground_scale
+                self.worker.top_scale_mm_px = top_scale
+                self.worker.ground_marker_size_mm = self.ground_marker_size_mm
+                self.worker.top_marker_size_mm = self.top_marker_size_mm
+
             QMessageBox.information(
                 self, "Kalibrasi Berhasil",
-                f"Skala fisik berhasil diperbarui:\nPIXEL_TO_MM = {new_scale:.6f} mm/px"
+                "Skala lokal berhasil diperbarui:\n"
+                f"Ground = {ground_scale:.6f} mm/px\nTop = {top_scale:.6f} mm/px"
             )
+        self.calib_dialog = None
+
+    def open_camera_calibration_dialog(self):
+        if self.latest_raw_frame is None:
+            QMessageBox.information(self, "Kalibrasi Kamera 3D", "Hubungkan kamera terlebih dahulu.")
+            return
+        self.camera_calib_dialog = CameraCalibrationDialog(self.latest_raw_frame, self)
+        if self.camera_calib_dialog.exec() == QDialog.DialogCode.Accepted:
+            intrinsics = self.camera_calib_dialog.result_intrinsics
+            if intrinsics is not None and self.worker:
+                self.worker.set_camera_intrinsics(intrinsics)
+            QMessageBox.information(
+                self, "Kalibrasi Kamera 3D",
+                "Parameter kamera tersimpan. Mode Delta Z aktif tetap memakai perubahan ukuran marker Top."
+            )
+        self.camera_calib_dialog = None
 
     # ── PENGUJIAN (START / STOP) ──────────────────────────────────
     def start_test(self):
@@ -2136,14 +3062,19 @@ class MainWindow(QMainWindow):
         self.worker.set_parameters(
             ground_id=0,
             top_id=1,
-            scale=self.spin_scale.value(),
-            baseline_frames=30
+            ground_scale_mm_px=self.spin_ground_scale.value(),
+            top_scale_mm_px=self.spin_top_scale.value(),
+            baseline_frames=60,
+            ground_marker_size_mm=self.ground_marker_size_mm,
+            top_marker_size_mm=self.top_marker_size_mm,
         )
 
         self.time_buffer.clear()
         self.x_buffer.clear()
         self.y_buffer.clear()
         self.z_buffer.clear()
+        self.frequency_time_buffer.clear()
+        self.frequency_x_buffer.clear()
         self.curve_x.setData([], [])
         self.curve_y.setData([], [])
         self.curve_z.setData([], [])
@@ -2160,14 +3091,25 @@ class MainWindow(QMainWindow):
         self.count_samples = 0
         self.total_frames_seen = 0
         self.locked_frames_count = 0
+        self.lbl_freq_val.setText("-- Hz")
+        self.lbl_freq_val.setToolTip("Menunggu sinyal lateral yang cukup dan stabil.")
+        self.lbl_drift_val.setText("0.00%")
+        self.lbl_final_height.setText("Indikator kedalaman/kemiringan Top")
 
         self.prog_baseline.setValue(0)
-        self.lbl_tare_percent.setText("0% Calculating...")
+        self.lbl_tare_percent.setText("Mencari Ground #0 dan Top #1...")
 
         self.worker.start_recording()
         self.btn_start.setEnabled(False)
         self.btn_stop.setEnabled(True)
         self.btn_calib.setEnabled(False)
+        self.spin_structure_height.setEnabled(False)
+        self.btn_validate_scale.setEnabled(True)
+
+        # Teks status berubah ketika rekaman dimulai. Jalankan sekali lagi
+        # setelah Qt menghitung ulang ukuran label agar sidebar tidak kembali
+        # ke susunan desktop yang terlalu sempit.
+        QTimer.singleShot(0, self._apply_responsive_layout)
 
         self.pill_run.setText("ACTIVE RUN")
         self.pill_run.setStyleSheet(
@@ -2184,6 +3126,7 @@ class MainWindow(QMainWindow):
         self.btn_start.setEnabled(True)
         self.btn_stop.setEnabled(False)
         self.btn_calib.setEnabled(True)
+        self.spin_structure_height.setEnabled(True)
 
         self.pill_run.setText("STANDBY")
         self.pill_run.setStyleSheet(
@@ -2201,18 +3144,35 @@ class MainWindow(QMainWindow):
         self.prog_baseline.setValue(current)
         percent = int(current / total * 100)
         if current >= total:
-            self.lbl_tare_percent.setText("100% Ready")
-            self.lbl_tare_percent.setStyleSheet("font-family: 'JetBrains Mono'; font-size: 11px; color: #059669; font-weight: bold;")
+            self.lbl_tare_percent.setText("100% Memeriksa stabilitas...")
+            self.lbl_tare_percent.setStyleSheet("font-family: 'JetBrains Mono'; font-size: 11px; color: #0284c7; font-weight: bold;")
         else:
             self.lbl_tare_percent.setText(f"{percent}% Tare...")
             self.lbl_tare_percent.setStyleSheet("font-family: 'JetBrains Mono'; font-size: 11px; color: #0284c7; font-weight: bold;")
+
+    def on_baseline_state(self, message, locked):
+        self.lbl_tare_percent.setText(message)
+        if locked and self.worker and not self.worker.baseline_forced:
+            self.prog_baseline.setValue(self.prog_baseline.maximum())
+            color = "#059669"
+        elif locked:
+            self.prog_baseline.setValue(self.prog_baseline.maximum())
+            color = "#d97706"
+        else:
+            color = "#d97706"
+        self.lbl_tare_percent.setStyleSheet(
+            f"font-family: 'JetBrains Mono'; font-size: 11px; color: {color}; font-weight: bold;"
+        )
 
     def on_new_data_point(self, now, frame_idx, disp_x, disp_y, disp_z, status, g_ok, t_ok):
         # 1. Update status marker di sidebar & footer
         self.total_frames_seen += 1
         locked_both = g_ok and t_ok
+        height_valid = bool(np.isfinite(disp_z))
         if locked_both:
             self.locked_frames_count += 1
+        if status == "ok" and locked_both:
+            self.last_valid_disp_x = disp_x
 
         self.badge_m0_status.setText("Locked" if g_ok else "Lost")
         self.badge_m0_status.setStyleSheet("background-color: #f0fdf4; color: #16a34a; border: 1px solid #bbf7d0; border-radius: 10px; padding: 2px 7px; font-size: 9px; font-weight: 600; font-family: 'JetBrains Mono';" if g_ok else "background-color: #fef2f2; color: #ef4444; border: 1px solid #fecaca; border-radius: 10px; padding: 2px 7px; font-size: 9px; font-weight: 600; font-family: 'JetBrains Mono';")
@@ -2255,13 +3215,14 @@ class MainWindow(QMainWindow):
         self.min_x = min(self.min_x, disp_x)
         self.max_y = max(self.max_y, disp_y)
         self.min_y = min(self.min_y, disp_y)
-        self.max_z = max(self.max_z, disp_z)
-        self.min_z = min(self.min_z, disp_z)
+        if height_valid:
+            self.max_z = max(self.max_z, disp_z)
+            self.min_z = min(self.min_z, disp_z)
 
-        unit = "mm" if self.spin_scale.value() else "px"
+        unit = "mm"
         self.lbl_sway_val.setText(f"{disp_x:+.2f}")
         self.lbl_drop_val.setText(f"{disp_y:+.2f}")
-        self.lbl_depth_val.setText(f"{disp_z:+.2f}")
+        self.lbl_depth_val.setText(f"{disp_z:+.2f}" if height_valid else "--")
 
         # Direction indicator
         if disp_x > 0.5:
@@ -2274,35 +3235,55 @@ class MainWindow(QMainWindow):
             self.badge_sway_dir.setText("Centered")
             self.badge_sway_dir.setStyleSheet("color: #64748b; font-family: 'JetBrains Mono'; font-size: 10px; font-weight: 600;")
 
-        # Z Direction indicator (Forward/Backward)
+        # Positive Delta Z means Top appears smaller/farther from the camera.
         if disp_z > 0.5:
-            self.badge_depth_dir.setText("Forward (+Z)")
+            self.badge_depth_dir.setText("Farther / Smaller")
             self.badge_depth_dir.setStyleSheet("color: #ea580c; font-family: 'JetBrains Mono'; font-size: 10px; font-weight: 600;")
         elif disp_z < -0.5:
-            self.badge_depth_dir.setText("Backward (-Z)")
+            self.badge_depth_dir.setText("Closer / Larger")
             self.badge_depth_dir.setStyleSheet("color: #d97706; font-family: 'JetBrains Mono'; font-size: 10px; font-weight: 600;")
         else:
-            self.badge_depth_dir.setText("Stable")
+            self.badge_depth_dir.setText("Scale Stable")
             self.badge_depth_dir.setStyleSheet("color: #64748b; font-family: 'JetBrains Mono'; font-size: 10px; font-weight: 600;")
 
         self.lbl_sway_limits.setText(f"Max: {self.max_x:+.2f} {unit}  |  Min: {self.min_x:+.2f} {unit}")
         self.lbl_drop_limits.setText(f"Max: {self.max_y:+.2f} {unit}  |  Min: {self.min_y:+.2f} {unit}")
-        self.lbl_depth_limits.setText(f"Max: {self.max_z:+.2f} {unit}  |  Min: {self.min_z:+.2f} {unit}")
+        if np.isfinite(self.max_z) and np.isfinite(self.min_z):
+            self.lbl_depth_limits.setText(f"Max: {self.max_z:+.2f} {unit}  |  Min: {self.min_z:+.2f} {unit}")
+            self.lbl_final_height.setText("Indikator kedalaman/kemiringan Top")
+        else:
+            self.lbl_depth_limits.setText("Menunggu ukuran marker Top")
+            self.lbl_final_height.setText("Indikator Z: --")
 
-        # 4. Drift Ratio & Frekuensi Alami Dominan
-        # Asumsi tinggi gedung referensi ~400mm jika belum spesifik, atau gunakan rasio displacement
-        ref_h = 400.0
-        drift_pct = (abs(disp_x) / ref_h) * 100.0
-        self.lbl_drift_val.setText(f"{drift_pct:.2f}%")
+        # 4. Drift memakai tinggi fisik miniatur, bukan tinggi asumsi tetap.
+        drift_result = calculate_drift_ratio(disp_x, self.spin_structure_height.value())
+        if drift_result["valid"]:
+            self.lbl_drift_val.setText(f"{drift_result['drift_ratio_pct']:.2f}%")
+        else:
+            self.lbl_drift_val.setText("--%")
+            self.lbl_drift_val.setToolTip(str(drift_result["reason"]))
 
-        # Estimasi Frekuensi Alami Dominan f1 dari zero crossings
-        if len(self.x_buffer) >= 30:
-            arr_x = np.array(self.x_buffer)
-            zero_crossings = np.where(np.diff(np.signbit(arr_x)))[0]
-            duration = self.time_buffer[-1] - self.time_buffer[0]
-            if duration > 1.0 and len(zero_crossings) > 2:
-                freq = (len(zero_crossings) / 2.0) / duration
-                self.lbl_freq_val.setText(f"{freq:.2f} Hz")
+        # Frekuensi hanya memakai frame dengan dua marker yang benar-benar terdeteksi.
+        if status == "ok" and locked_both:
+            self.frequency_time_buffer.append(now)
+            self.frequency_x_buffer.append(disp_x)
+        while self.frequency_time_buffer and now - self.frequency_time_buffer[0] > self.frequency_window_sec:
+            self.frequency_time_buffer.popleft()
+            self.frequency_x_buffer.popleft()
+
+        frequency_result = estimate_dominant_frequency(
+            self.frequency_time_buffer,
+            self.frequency_x_buffer,
+        )
+        if frequency_result["valid"]:
+            self.lbl_freq_val.setText(f"{frequency_result['frequency_hz']:.2f} Hz")
+            self.lbl_freq_val.setToolTip(
+                f"FFT detrended | SNR {frequency_result['snr_db']:.1f} dB | "
+                f"sampling {frequency_result['sample_rate_hz']:.1f} Hz"
+            )
+        else:
+            self.lbl_freq_val.setText("-- Hz")
+            self.lbl_freq_val.setToolTip(str(frequency_result["reason"]))
 
     # ── PENYIMPANAN & EKSPOR DATA ─────────────────────────────────
     def on_test_finished(self, summary):
@@ -2318,9 +3299,9 @@ class MainWindow(QMainWindow):
                 )
                 return
 
-            unit_label = "mm" if self.spin_scale.value() else "px"
-            pos_unit = "mm" if self.spin_scale.value() else "piksel"
-            disp_unit = "mm" if self.spin_scale.value() else "piksel"
+            unit_label = "mm"
+            pos_unit = "mm"
+            disp_unit = "mm"
 
             result_dir = os.path.abspath("result")
             os.makedirs(result_dir, exist_ok=True)
@@ -2330,20 +3311,22 @@ class MainWindow(QMainWindow):
             csv_path = os.path.join(result_dir, f"data_gempa_{timestamp_str}.csv")
             txt_path = os.path.join(result_dir, f"tabel_data_gempa_{timestamp_str}.txt")
             png_path = os.path.join(result_dir, f"grafik_gempa_{timestamp_str}.png")
+            quality_path = os.path.join(result_dir, f"kualitas_data_{timestamp_str}.json")
+            quality = summary.get("quality", {})
 
             headers = [
                 "timestamp_s", "frame",
-                f"ground_x_{unit_label}", f"ground_y_{unit_label}", f"ground_z_{unit_label}",
-                f"top_x_{unit_label}", f"top_y_{unit_label}", f"top_z_{unit_label}",
-                f"disp_x_{unit_label}", f"disp_y_{unit_label}", f"disp_z_{unit_label}",
-                "status"
+                f"ground_x_{unit_label}", f"ground_y_{unit_label}", "ground_z_reference",
+                f"top_x_{unit_label}", f"top_y_{unit_label}", f"top_z_size_estimate_{unit_label}",
+                f"disp_x_{unit_label}", f"disp_y_{unit_label}", f"delta_z_top_{unit_label}",
+                "status", "z_status"
             ]
             units = [
                 "[s]", "[frame#]",
                 f"[{pos_unit}]", f"[{pos_unit}]", f"[{pos_unit}]",
                 f"[{pos_unit}]", f"[{pos_unit}]", f"[{pos_unit}]",
                 f"[{disp_unit}]", f"[{disp_unit}]", f"[{disp_unit}]",
-                "[-]"
+                "[-]", "[-]"
             ]
 
             saved_items = []
@@ -2355,7 +3338,12 @@ class MainWindow(QMainWindow):
                     writer = csv.writer(f, delimiter="|")
                     writer.writerow([
                         "# METADATA",
-                        f"kalibrasi_PIXEL_TO_MM={self.spin_scale.value()}",
+                        f"kalibrasi_ground_mm_per_px={self.spin_ground_scale.value()}",
+                        f"kalibrasi_top_mm_per_px={self.spin_top_scale.value()}",
+                        f"tinggi_miniatur_mm={self.spin_structure_height.value()}",
+                        f"tracking_valid_pct={quality.get('tracking_valid_pct', 0.0):.2f}",
+                        f"frame_interpolasi_dikeluarkan={quality.get('interpolated_frames_excluded', 0)}",
+                        f"mode_pengukuran_Z={summary.get('z_measurement_mode', 'optical_estimate')}",
                         f"satuan_posisi={pos_unit}",
                         f"satuan_displacement={disp_unit}",
                         f"satuan_waktu=detik"
@@ -2380,7 +3368,12 @@ class MainWindow(QMainWindow):
 
             # 3. Simpan TXT
             try:
-                if save_txt_table(txt_path, headers, all_rows, self.spin_scale.value(), summary.get("total_frames", 0)):
+                if save_txt_table(
+                    txt_path, headers, all_rows,
+                    f"Ground={self.spin_ground_scale.value():.6f} mm/px; Top={self.spin_top_scale.value():.6f} mm/px",
+                    summary.get("total_frames", 0),
+                    self.spin_structure_height.value()
+                ):
                     saved_items.append(f"Tabel: result/{os.path.basename(txt_path)}")
             except Exception as e:
                 errors.append(f"TXT: {e}")
@@ -2394,6 +3387,26 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 errors.append(f"PNG: {e}")
 
+            # 5. Simpan laporan kualitas dan parameter pengukuran.
+            try:
+                calibration = {
+                    "ground_scale_mm_px": self.spin_ground_scale.value(),
+                    "top_scale_mm_px": self.spin_top_scale.value(),
+                    "structure_height_mm": self.spin_structure_height.value(),
+                    "physical_validation": self.last_scale_validation,
+                    "physical_validation_tolerance_pct": (
+                        self.last_scale_validation.get("tolerance_pct")
+                        if self.last_scale_validation else None
+                    ),
+                    "filter": "first_order_lowpass_12Hz_xy",
+                    "interpolated_frames_used_for_metrics": False,
+                    "z_measurement_mode": summary.get("z_measurement_mode", "optical_estimate"),
+                }
+                if save_quality_report(quality_path, quality, calibration):
+                    saved_items.append(f"Kualitas: result/{os.path.basename(quality_path)}")
+            except Exception as e:
+                errors.append(f"Kualitas: {e}")
+
             elapsed_str = self.lbl_elapsed_time.text() if hasattr(self, 'lbl_elapsed_time') else "-"
             summary_files = "\n• " + "\n• ".join(saved_items) if saved_items else "Gagal menyimpan berkas."
             err_msg = f"\n\n⚠ Catatan peringatan: {', '.join(errors)}" if errors else ""
@@ -2404,6 +3417,9 @@ class MainWindow(QMainWindow):
                 f"Data simulasi getaran gedung berhasil direkam & diekspor ke folder 'result'!\n"
                 f"{summary_files}\n\n"
                 f"Total Frame Terekam: {summary.get('total_frames', 0):,}\n"
+                f"Frame valid: {quality.get('valid_frames', 0):,} "
+                f"({quality.get('tracking_valid_pct', 0.0):.1f}%)\n"
+                f"Frame interpolasi dikeluarkan: {quality.get('interpolated_frames_excluded', 0):,}\n"
                 f"Durasi Uji: {elapsed_str} detik"
                 f"{err_msg}"
             )

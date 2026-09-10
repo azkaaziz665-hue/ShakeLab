@@ -1,0 +1,304 @@
+PANDUAN PENGGUNAAN SHAKELAB
+Pengukuran Respons Miniatur Bangunan Saat Diberi Getaran
+
+TUJUAN APLIKASI
+ShakeLab membaca dua marker ArUco dari kamera:
+- Ground, ID #0: ditempel kaku pada meja getar atau dasar miniatur.
+- Top, ID #1: ditempel kaku pada bagian atas miniatur bangunan.
+
+Aplikasi membandingkan gerak Top terhadap Ground. Saat meja dan bangunan
+bergerak bersama-sama, gerak yang sama akan dikurangi. Nilai utama yang dibaca
+adalah perubahan struktur relatif terhadap dasarnya, bukan sekadar gerak meja.
+
+CATATAN PENTING
+ShakeLab adalah alat ukur berbasis kamera. Hasil harus divalidasi dengan
+mistar/rel geser atau alat pembanding lain sebelum dipakai sebagai data
+penelitian atau keputusan struktur. Perubahan tinggi dari satu kamera lebih
+mudah terpengaruh noise daripada perpindahan X/Y.
+
+======================================================================
+1. PERSIAPAN ALAT
+======================================================================
+
+Siapkan:
+1. Miniatur bangunan dan meja getar.
+2. Dua marker ArUco: Ground ID #0 dan Top ID #1.
+3. Kamera USB atau HP sebagai kamera USB/IP, tripod yang kaku, dan lampu.
+4. Mistar atau rel geser untuk memeriksa skala perpindahan.
+5. Checkerboard hanya bila ingin menyimpan kalibrasi kamera untuk penggunaan
+   lain. Mode Delta Z aktif tidak membutuhkannya.
+
+Pasang marker:
+1. Tempel Ground ID #0 pada meja/dasar yang bergerak bersama dasar bangunan.
+2. Tempel Top ID #1 pada bagian paling atas miniatur yang ingin diamati.
+3. Marker harus datar, kaku, tidak melengkung, dan tidak tertutup.
+4. Kedua marker harus selalu terlihat utuh selama lintasan getaran.
+5. Pasang kamera pada tripod yang TIDAK ikut bergetar bersama meja.
+
+Pencahayaan dan kamera:
+1. Beri cahaya terang dan merata. Hindari pantulan mengilap pada marker.
+2. Arahkan kamera agar kedua marker terlihat jelas dan cukup besar.
+3. Usahakan sisi setiap marker tampak minimal 80 sampai 120 piksel pada video.
+4. Kunci posisi kamera. Jangan mengubah zoom, fokus, resolusi, atau sudut
+   kamera setelah melakukan kalibrasi.
+5. Kamera 30 FPS cukup untuk getaran lambat. Gunakan 60 FPS bila getaran cepat
+   atau amplitudonya besar. FPS tinggi tidak menghilangkan marker hilang bila
+   frame tetap blur; cahaya dan shutter cepat tetap penting.
+
+======================================================================
+2. MENYALAKAN DAN MENGHUBUNGKAN KAMERA
+======================================================================
+
+1. Jalankan aplikasi:
+   - Menggunakan file batch: Klik ganda "jalankan_aplikasi.bat"
+   - Atau via terminal: python gui_app.py
+2. Pada panel CAMERA SOURCE, pilih tipe koneksi kamera:
+   - Pilih tab "USB" untuk webcam internal laptop atau kamera eksternal USB /
+     kamera HP yang tersambung via kabel USB.
+   - Pilih tab "IP" bila menggunakan stream kamera nirkabel / jaringan lokal.
+3. Pemilihan Kamera USB (Auto-Deteksi):
+   - Aplikasi secara otomatis mendeteksi dan menampilkan daftar nama perangkat
+     kamera asli dari Windows (misalnya: "Integrated Camera", "USB2.0 HD UVC WebCam",
+     "Iriun Webcam", "DroidCam Source", dll.), bukan sekadar indeks angka OpenCV.
+   - Tidak diperlukan lagi input manual nama kamera (tombol "Nama" telah dihapus
+     karena penamaan kini 100% otomatis).
+   - Jika kamera eksternal baru dicolokkan ke laptop saat aplikasi sudah terbuka,
+     tekan tombol refresh (↺) di sebelah dropdown. Aplikasi akan memindai ulang
+     perangkat secara cepat di background thread tanpa membuat antarmuka freeze.
+   - Pilih nama kamera yang ingin digunakan dari menu dropdown.
+4. Pemilihan Kamera IP (Jika memakai stream jaringan):
+   - Masukkan URL stream video kamera (contoh: http://192.168.1.50:8080/video
+     atau rtsp://...).
+5. Klik tombol "Hubungkan Kamera":
+   - Tombol akan berubah menjadi "Putuskan Kamera".
+   - Indikator status kamera di header dan footer akan berubah menjadi hijau (aktif).
+   - Notifikasi status menampilkan nama perangkat asli serta resolusi aktifnya
+     (contoh: "Integrated Camera terhubung (1920x1080)").
+6. Periksa tampilan pada panel LIVE CAMERA FEED:
+   - Pastikan kedua marker terdeteksi dengan kotak pembatas (bounding box):
+     Ground ID #0 (warna hijau) dan Top ID #1 (warna biru/oranye).
+   - Pastikan sudut marker terlihat jelas tanpa terhalang atau berbayang.
+   - BILA SALAH SATU MARKER TIDAK TERDETEKSI, JANGAN MEMULAI PENGUJIAN.
+7. Tunggu beberapa detik agar autofocus dan auto-exposure kamera stabil
+   sebelum melanjutkan ke kalibrasi atau pengujian.
+
+======================================================================
+3. KALIBRASI DUA SKALA LOKAL UNTUK X DAN Y
+======================================================================
+
+Skala lokal mengubah perpindahan pixel menjadi milimeter. Ground dan Top
+memakai skala sendiri karena keduanya dapat berada pada tinggi atau jarak
+kamera yang berbeda.
+
+1. Ukur sisi fisik marker Ground dan Top setelah dicetak, dalam mm.
+2. Klik tombol Kalibrasi pada bagian SCALE CALIBRATION.
+3. Pastikan kedua marker terbaca dengan ID yang benar.
+4. Isi ukuran sisi marker Ground dan sisi marker Top sesuai hasil pengukuran.
+5. Tekan Terapkan Dua Skala.
+
+Aplikasi menghitung:
+  Skala Ground = sisi fisik Ground / sisi Ground pada gambar
+  Skala Top    = sisi fisik Top / sisi Top pada gambar
+
+Nilai Ground dan Top pada layar akan tampil dalam mm/pixel. Jangan memakai
+satu skala Top untuk Ground, atau sebaliknya.
+
+======================================================================
+4. UJI FISIK SKALA LOKAL
+======================================================================
+
+Kalibrasi ukuran marker perlu diperiksa dengan gerakan fisik yang diketahui.
+Lakukan Top dan Ground SECARA TERPISAH, menggunakan mistar atau rel geser.
+
+Uji marker Top:
+1. Buat Ground diam.
+2. Geser Top sejauh 10 mm, 20 mm, lalu 30 mm dengan arah yang sama.
+3. Jalankan Start/Resume, tunggu tare selesai, lalu lakukan satu gerakan.
+4. Catat pembacaan top_x_mm dari hasil data.
+5. Klik Uji Fisik Skala Lokal, pilih Top ID #1, isi nilai mistar dan nilai
+   pembacaan aplikasi, lalu tekan Periksa.
+
+Uji marker Ground:
+1. Buat Top diam.
+2. Geser Ground atau meja sejauh 10 mm, 20 mm, lalu 30 mm.
+3. Periksa Ground ID #0 dengan cara yang sama.
+
+Jangan memakai disp_x_mm untuk mengoreksi satu marker. disp_x_mm adalah
+selisih Top terhadap Ground. Untuk koreksi skala Top gunakan top_x_mm; untuk
+koreksi Ground gunakan ground_x_mm.
+
+======================================================================
+5. KALIBRASI KAMERA 3D (OPSIONAL)
+======================================================================
+
+Mode Delta Z aktif memakai perubahan ukuran marker Top, bukan pose checkerboard.
+Kalibrasi ini tidak diperlukan untuk pengujian Delta Z berbasis ukuran marker.
+
+1. Gunakan checkerboard 9 x 6 SUDUT DALAM. Untuk papan yang tersedia, sisi
+   kotak dirancang 20 mm. Cetak pada Actual Size/100 persen.
+2. Sisakan margin putih minimal satu lebar kotak di sekeliling checkerboard.
+3. Ukur satu kotak setelah dicetak. Masukkan ukuran hasil pengukuran, bukan
+   angka desain bila cetakan berubah ukuran.
+4. Klik Kalibrasi Kamera 3D.
+5. Isi Sudut kolom = 9, Sudut baris = 6, dan Sisi kotak = ukuran nyata dalam
+   mm.
+6. Ambil 15 sampai 25 frame checkerboard. Papan harus memenuhi sebagian besar
+   area kamera pada posisi tengah, kiri, kanan, atas, bawah, dekat, jauh, dan
+   beberapa kemiringan. Jangan mengambil banyak frame pada posisi yang sama.
+7. Klik Hitung dan Simpan. Parameter disimpan dalam camera_intrinsics.json.
+8. Nilai RMS yang lebih kecil lebih baik: di bawah 0.5 px sangat baik, 0.5
+   sampai 1.0 px baik, dan di atas 1.5 px sebaiknya kalibrasi diulang.
+
+Kalibrasi ini harus diulang bila kamera, resolusi, fokus, zoom, atau orientasi
+kamera berubah.
+
+======================================================================
+6. MENJALANKAN UJI GETARAN
+======================================================================
+
+1. Masukkan Tinggi Miniatur, yaitu jarak vertikal fisik dari dasar Ground ke
+   lokasi marker Top, dalam mm. Nilai ini dipakai untuk drift ratio.
+2. Pastikan meja, miniatur, dan kamera sudah diam.
+3. Klik Start/Resume.
+4. Jangan memberi getaran selama proses Baseline Tare Filter. Tunggu pesan
+   "Tare stabil. Perekaman dan grafik berjalan."
+5. Bila muncul "Tare kurang stabil", ulangi sesi setelah memperbaiki cahaya,
+   tripod, fokus, atau posisi marker. Aplikasi dapat tetap merekam memakai
+   baseline median, tetapi kualitas titik nol lebih rendah.
+6. Jalankan meja getar sesuai skenario pengujian.
+7. Pantau LIVE CAMERA FEED. Bila salah satu marker hilang, blur, atau keluar
+   frame, hentikan uji dan perbaiki kondisi kamera. Jangan menyimpulkan data
+   dari bagian saat marker hilang.
+8. Setelah getaran selesai, diamkan miniatur 3 sampai 5 detik. Bagian ini
+   membantu melihat apakah terdapat pergeseran relatif yang tersisa.
+9. Klik Stop and Save. Aplikasi membuat file hasil dalam folder result.
+
+======================================================================
+7. MEMBACA LAYAR SELAMA UJI
+======================================================================
+
+- Delta X / Lateral Sway: simpangan Top terhadap Ground pada arah horizontal
+  kamera. Tanda plus/minus menunjukkan arah terhadap arah sumbu kamera.
+- Delta Y / Vertical Drop: simpangan relatif pada arah vertikal gambar kamera.
+  Ini bukan selalu tinggi fisik bila kamera dipasang miring.
+- Delta Z / Skala Marker Top: perubahan jarak arah kamera atau perubahan
+  kemiringan marker Top yang diestimasi dari perubahan ukurannya di gambar.
+  Marker mengecil berarti tampak lebih jauh; marker membesar berarti tampak
+  lebih dekat. Ini bukan tinggi vertikal mutlak bangunan.
+- Drift Ratio: abs(Delta X) / Tinggi Miniatur x 100 persen. Ini adalah rasio
+  simpangan lateral terhadap tinggi yang dimasukkan pengguna.
+- Frequency: frekuensi dominan gerak lateral dari data Delta X. Nilai akan
+  tampil hanya jika durasi, FPS, dan kualitas sinyal mencukupi.
+- Tracking: persentase frame dengan kedua marker terdeteksi.
+
+======================================================================
+8. FILE HASIL DALAM FOLDER result
+======================================================================
+
+Setelah Stop and Save, aplikasi membuat:
+- data_gempa_TANGGAL_WAKTU.xlsx : tabel Excel untuk dibaca dan dianalisis.
+- data_gempa_TANGGAL_WAKTU.csv  : data teks dipisah tanda |.
+- tabel_data_gempa_TANGGAL_WAKTU.txt : tabel teks.
+- grafik_gempa_TANGGAL_WAKTU.png : grafik X, Y, dan Delta Z marker Top.
+- kualitas_data_TANGGAL_WAKTU.json : ringkasan kualitas tracking, baseline,
+  FPS, serta parameter pengukuran.
+
+======================================================================
+9. ARTI KOLOM PADA TABEL EXCEL
+======================================================================
+
+Setiap baris adalah satu frame yang valid, saat Ground dan Top sama-sama
+terdeteksi. Satuan posisi dan perpindahan adalah mm.
+
+timestamp_s
+  Waktu sejak tombol Start/Resume ditekan, dalam detik.
+
+frame
+  Nomor urut frame yang dibaca aplikasi. Bukan waktu; gunakan timestamp_s
+  untuk membuat grafik atau menghitung kecepatan/frekuensi.
+
+ground_x_mm dan ground_y_mm
+  Pergerakan marker Ground terhadap posisi awalnya. Nilai ini menggambarkan
+  gerak meja/dasar pada arah X dan Y kamera.
+
+ground_z_reference
+  Kolom referensi bernilai 0 pada mode Delta Z marker Top. Ground tidak dipakai
+  untuk perhitungan Delta Z ini.
+
+top_x_mm dan top_y_mm
+  Pergerakan marker Top terhadap posisi awalnya pada arah X dan Y kamera.
+
+top_z_size_estimate_mm
+  Perkiraan perubahan arah kamera dari perubahan ukuran marker Top. Ini sama
+  dengan nilai Delta Z sebelum perataan tampilan.
+
+disp_x_mm
+  Simpangan lateral relatif struktur:
+  disp_x = top_x_mm - ground_x_mm
+  Ini adalah kolom utama untuk melihat goyangan struktur ke arah X.
+
+disp_y_mm
+  Simpangan relatif arah Y:
+  disp_y = top_y_mm - ground_y_mm
+  Gunakan hanya bila arah Y kamera sudah disesuaikan dengan arah fisik yang
+  ingin diuji.
+
+delta_z_top_mm
+  Estimasi perubahan ukuran marker Top menjadi perubahan jarak sepanjang arah
+  pandang kamera. Nilai positif berarti marker Top mengecil atau tampak lebih
+  jauh. Nilai negatif berarti marker membesar atau tampak lebih dekat. Nilai
+  ini juga dapat berubah bila marker Top miring, sehingga harus dibaca sebagai
+  indikator kedalaman/kemiringan, bukan tinggi vertikal mutlak.
+
+z_status
+  "top_marker_size" berarti Delta Z dihitung dari ukuran marker Top saat ini
+  dibanding ukuran marker Top pada baseline.
+
+status
+  Kualitas deteksi untuk sampel tersebut. "ok" berarti dua marker terdeteksi
+  langsung pada frame itu. Frame interpolasi atau marker hilang tidak dipakai
+  sebagai sampel data ekspor utama.
+
+Baris metadata pada CSV juga memuat dua skala lokal, tinggi miniatur, persen
+tracking valid, jumlah frame interpolasi yang dikeluarkan, dan mode pengukuran
+perubahan tinggi.
+
+======================================================================
+10. CARA MENILAI DATA LAYAK ATAU TIDAK
+======================================================================
+
+Data lebih layak digunakan bila:
+1. Tare menunjukkan status stabil sebelum getaran dimulai.
+2. Tracking valid tinggi dan marker tidak sering hilang.
+3. Uji fisik Ground dan Top menunjukkan galat yang kecil serta konsisten pada
+   beberapa jarak referensi.
+4. Kamera tidak berpindah dan kondisi cahaya tidak berubah selama pengujian.
+5. Hasil disp_x_mm saat kondisi akhir dibandingkan dengan kondisi awal masuk
+   akal secara visual dan, bila memungkinkan, dikonfirmasi dengan mistar.
+
+Jangan memakai hasil sebagai ukuran absolut bila marker hilang berulang,
+baseline tidak stabil, atau delta_z_top_mm melonjak besar ketika bangunan
+sebenarnya diam. Dalam kondisi tersebut, ulangi pemasangan dan kalibrasi.
+
+======================================================================
+11. MENYELESAIKAN PENGUJIAN DAN MEMUTUSKAN KAMERA
+======================================================================
+
+1. Meninjau Hasil Uji:
+   - Setelah menekan "Stop and Save", dialog "Ringkasan Hasil & Kualitas Data"
+     akan muncul secara otomatis.
+   - Evaluasi metrik utama: Tracking Rate (idealnya >95%), Baseline Quality,
+     Peak Displacement X/Y/Z, Maximum Drift Ratio, dan Frekuensi Dominan.
+   - Buka folder "result" jika ingin langsung membuka file Excel (.xlsx), grafik
+     (.png), atau laporan teks.
+2. Memulai Pengujian Baru:
+   - Jika ingin menjalankan uji getaran berikutnya dengan konfigurasi yang sama,
+     cukup pastikan meja getar telah berhenti sempurna.
+   - Tekan tombol "Start/Resume" kembali. Aplikasi akan otomatis menjalankan
+     siklus Tare baru dan siap merekam getaran berikutnya.
+3. Memutuskan Kamera & Menutup Aplikasi:
+   - Sebelum mencabut kabel USB kamera atau menutup aplikasi, klik tombol
+     "Putuskan Kamera".
+   - Tunggu hingga status kamera kembali "Off" / "Disconnected".
+   - Tutup jendela aplikasi ShakeLab.
+

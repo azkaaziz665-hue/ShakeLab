@@ -1,0 +1,339 @@
+================================================================================
+RUMUS DAN METODOLOGI PERHITUNGAN DISPLACEMENT (DISP X, Y, Z)
+SISTEM MONITORING SIMULASI GEMPA MINIATUR BANGUNAN BERBASIS COMPUTER VISION
+================================================================================
+
+1. PENDAHULUAN & PRINSIP PENGUKURAN
+--------------------------------------------------------------------------------
+Sistem ini menggunakan kamera optik 2D (computer vision) dengan 2 buah marker
+ArUco fiducial:
+  - Marker Ground (Pondasi / Meja Getar) : Melacak pergerakan tanah/input gempa.
+  - Marker Top    (Atap / Lantai Puncak) : Melacak respon struktur bangunan.
+
+Tujuan utama analisis struktur adalah mengukur simpangan relatif antar-lantai
+(inter-story drift / displacement), yaitu seberapa besar lantai atas menyimpang
+relatif terhadap lantai bawah/pondasinya.
+
+
+================================================================================
+2. FAKTOR KONVERSI & KALIBRASI (PIXEL TO MM)
+================================================================================
+Kamera membaca koordinat dalam satuan piksel (px). Untuk mengubahnya ke milimeter (mm),
+sistem menyediakan metode kalibrasi terpadu yang menggabungkan ukuran fisik
+marker ArUco dan jarak ketinggian vertikal antar-marker secara simultan:
+
+--------------------------------------------------------------------------------
+METODE TERPADU (REKOMENDASI UTAMA): FUSI UKURAN MARKER & JARAK TINGGI GROUND-TOP
+--------------------------------------------------------------------------------
+LATAR BELAKANG & ALASAN TIDAK MENGAMBANG:
+Jika hanya menggunakan ukuran sisi marker, sering timbul dilema: "Gunakan marker
+Ground atau marker Top?". Mengambil rata-rata aritmatika biasa (s_ground + s_top)/2
+menjadi nilai kompromi yang mengambang tanpa jangkar fisik global.
+Sebaliknya, metode FUSI TERPADU ini menggabungkan 3 kendala fisik simultan:
+  1. Dimensi lokal marker Ground (L_ground)
+  2. Dimensi lokal marker Top (L_top)
+  3. Bentangan ketinggian makro miniatur gedung (H_fisik / D_fisik)
+
+Dengan memadukan ketiganya dalam satu rasio kumulatif terbobot, faktor konversi
+terkunci kuat (ter-anchor) secara global dari lantai dasar hingga atap gedung!
+
++------------------------------------------------------------------------------+
+| KASUS 1: MARKER SEJAJAR SECARA VERTIKAL (SEGARIS ATAS-BAWAH)                 |
+|                                                                              |
+|                      L_ground + L_top + H_fisik                              |
+|      PIXEL_TO_MM = ------------------------------   (Satuan: mm/px)          |
+|                     s_ground + s_top + Delta_Y_px                            |
++------------------------------------------------------------------------------+
+
++------------------------------------------------------------------------------+
+| KASUS 2: MARKER TIDAK SEJAJAR VERTIKAL (BERGESER HORIZONTAL / MIRING)        |
+|                                                                              |
+|                      L_ground + L_top + D_fisik                              |
+|      PIXEL_TO_MM = ------------------------------   (Satuan: mm/px)          |
+|                       s_ground + s_top + D_px                                |
+|                                                                              |
+| di mana:                                                                     |
+| D_px    = SQRT( (X_top - X_ground)^2 + (Y_top - Y_ground)^2 ) (px)           |
+| D_fisik = Jarak diagonal langsung antar-pusat marker diukur mistar (mm)     |
++------------------------------------------------------------------------------+
+
+KETERANGAN VARIABEL:
+1. VARIABEL FISIK (DIUKUR MANUAL DENGAN MISTAR / JANGKA SORONG DALAM MM):
+   - L_ground : Panjang sisi fisik cetakan marker Ground (misal: 40.0 mm)
+   - L_top    : Panjang sisi fisik cetakan marker Top    (misal: 40.0 mm)
+   - H_fisik  : Jarak ketinggian vertikal dari pusat marker Ground ke pusat
+                marker Top saat gedung istirahat/diam tegak (misal: 350.0 mm)
+   - D_fisik  : Jarak garis lurus langsung antar-pusat marker jika tidak segaris
+
+2. VARIABEL CITRA KAMERA (DITANGKAP OTOMATIS OLEH ALGORITMA OPENCV DALAM PIKSEL):
+   - s_ground   : Rata-rata 4 panjang sisi marker Ground di kamera (px)
+   - s_top      : Rata-rata 4 panjang sisi marker Top di kamera (px)
+   - Delta_Y_px : Selisih koordinat vertikal antar-pusat marker di kamera:
+                  Delta_Y_px = | Y_top - Y_ground | (px)
+   - D_px       : Jarak diagonal Euclidean antar-pusat marker di citra kamera (px)
+
+CONTOH LANGKAH PERHITUNGAN RIIL (KASUS 1):
+  Diketahui data eksperimen:
+    - Ukuran fisik sisi marker : L_ground = 40.0 mm, L_top = 40.0 mm
+    - Tinggi fisik Ground-Top  : H_fisik  = 350.0 mm
+    - Terdeteksi di kamera     : s_ground = 151.2 px
+                                 s_top    = 149.6 px
+                                 Delta_Y  = 1318.0 px
+
+  Langkah 1: Hitung Total Panjang Fisik (Pembilang)
+    Total_Fisik = L_ground + L_top + H_fisik
+                = 40.0 + 40.0 + 350.0 = 430.0 mm
+
+  Langkah 2: Hitung Total Panjang Piksel di Kamera (Penyebut)
+    Total_Piksel = s_ground + s_top + Delta_Y_px
+                 = 151.2 + 149.6 + 1318.0 = 1618.8 px
+
+  Langkah 3: Hitung Nilai Konversi Skala (PIXEL_TO_MM)
+    PIXEL_TO_MM = Total_Fisik / Total_Piksel
+                = 430.0 / 1618.8
+                = 0.265629 mm/px
+
+FORMULASI ALTERNATIF: REGRESI KUADRAT TERKECIL (OPTIMAL LEAST-SQUARES FUSION)
+Secara statistik meminimalkan fungsi galat residual kuadratik:
+  E(S) = (L_ground - S * s_ground)^2 + (L_top - S * s_top)^2 + (H - S * Delta_Y_px)^2
+
+Diferensiasi dE/dS = 0 menghasilkan:
+
+                  L_ground * s_ground + L_top * s_top + H * Delta_Y_px
+  PIXEL_TO_MM = --------------------------------------------------------   (mm/px)
+                           s_ground^2 + s_top^2 + Delta_Y_px^2
+
+KEUNGGULAN UTAMA METODE INI:
+1. Tidak "Mengambang": Mengunci rasio skala ke ketinggian nyata struktur (H).
+2. Akurasi Ganda: Menggabungkan ketelitian sub-piksel kontur marker dengan
+   bentang makro ketinggian miniatur gedung.
+3. Adil untuk Kedua Titik: Gerakan meja getar (Ground) dan simpangan atap (Top)
+   terkalibrasi dengan ketelitian metrologis yang konsisten.
+
+
+
+--------------------------------------------------------------------------------
+METODE 2: BERBASIS SELISIH KETINGGIAN / JARAK ANTAR-MARKER (INTER-MARKER BASELINE)
+--------------------------------------------------------------------------------
+KEUNGGULAN METROLOGIS (AKURASI TINGGI):
+Metode ini memanfaatkan bentangan fisik gedung yang panjang (Ground ke Top).
+Pada marker kecil (40 mm ~ 150 px), noise deteksi 1 px menimbulkan galat 0.67%.
+Sedangkan pada ketinggian gedung (misal 400 mm ~ 1500 px), noise deteksi 1 px
+hanya menimbulkan galat 0.067% (10x LIPAT LEBIH PRESISI & TAHAN NOISE).
+
+PENDEKATAN A: SELISIH KETINGGIAN VERTIKAL MURNI (DELTA Y)
+Gunakan pendekatan ini jika marker Ground dan Top terpasang segaris vertikal:
+
+1. Ukur tinggi fisik dari pusat marker Ground ke pusat marker Top saat gedung diam:
+   H_fisik  (mm)
+
+2. Kamera mendeteksi koordinat titik pusat kedua marker saat kondisi diam:
+   Pusat Ground = (X_ground, Y_ground)
+   Pusat Top    = (X_top,    Y_top)
+
+   Selisih ketinggian di layar kamera:
+   Delta_Y_px = | Y_top - Y_ground |   (px)
+
+3. Faktor Skala Kalibrasi:
+                    H_fisik (mm)
+   PIXEL_TO_MM = ------------------   (mm/px)
+                    Delta_Y_px (px)
+
+PENDEKATAN B: JARAK EUCLIDEAN LURUS 2D (TAHAN KEMIRINGAN)
+Gunakan pendekatan ini jika posisi marker Top sedikit bergeser ke kiri/kanan:
+
+1. Ukur jarak diagonal langsung antar-pusat kedua marker:
+   D_fisik  (mm)
+
+2. Jarak Euclidean piksel di kamera:
+   D_px = SQRT( (X_top - X_ground)^2 + (Y_top - Y_ground)^2 )   (px)
+
+3. Faktor Skala Kalibrasi:
+                    D_fisik (mm)
+   PIXEL_TO_MM = -----------------   (mm/px)
+                      D_px (px)
+
+CONTOH PERHITUNGAN:
+  - Jarak tinggi fisik antar-pusat Ground ke Top (H_fisik) = 380.0 mm
+  - Titik pusat Ground di kamera = (320.0, 450.5) px
+  - Titik pusat Top di kamera    = (320.0,  70.5) px
+  
+  Delta_Y_px  = | 70.5 - 450.5 | = 380.0 px (atau misal 1432.4 px pada resolusi HD)
+  Jika Delta_Y_px = 1432.4 px:
+  PIXEL_TO_MM = 380.0 / 1432.4 = 0.265289 mm/px
+
+SYARAT KEABSAHAN METODE INI:
+  1. Pengukuran jarak fisik harus dilakukan saat miniatur gedung dalam posisi
+     istirahat tegak sempurna (sebelum getaran gempa dinyalakan).
+  2. Kamera harus menghadap tegak lurus (level) terhadap miniatur gedung agar
+     tidak terjadi distorsi perspektif trapesium atas-bawah.
+  3. Kedua marker berada pada bidang kedalaman Z yang sama (coplanar).
+
+
+
+================================================================================
+3. RUMUS DISPLACEMENT SUMBU X DAN Y (BIDANG 2D / IN-PLANE)
+================================================================================
+Sumbu X = Pergerakan horizontal (kiri / kanan).
+Sumbu Y = Pergerakan vertikal (atas / bawah / lendutan).
+
+LANGKAH 1: Hitung Jarak Relatif Piksel Tiap Frame
+--------------------------------------------------------------------------------
+Pada setiap frame ke-i:
+  rel_x = X_top - X_ground   (px)
+  rel_y = Y_top - Y_ground   (px)
+
+Di mana:
+  (X_top, Y_top)       = Titik koordinat pusat marker Top pada citra kamera (px)
+  (X_ground, Y_ground) = Titik koordinat pusat marker Ground pada citra kamera (px)
+
+LANGKAH 2: Koreksi Baseline / Tare Nol (Kondisi Diam Awal)
+--------------------------------------------------------------------------------
+Saat pengujian dimulai, sistem merekam N frame awal (default: 30 frame) saat
+bangunan dalam kondisi diam untuk mendapatkan nilai posisi awal (baseline):
+
+  baseline_x = (1 / N) * SUM( rel_x_0 )
+  baseline_y = (1 / N) * SUM( rel_y_0 )
+
+Selisih simpangan terhadap kondisi diam (dalam piksel):
+  delta_x_px = rel_x - baseline_x   (px)
+  delta_y_px = rel_y - baseline_y   (px)
+
+LANGKAH 3: Konversi ke Satuan Milimeter (mm)
+--------------------------------------------------------------------------------
+  disp_x = delta_x_px * scale   (mm)
+  disp_y = delta_y_px * scale   (mm)
+
+INTERPRETASI NILAI:
+  - disp_x > 0 (+) : Gedung meliuk ke kanan relatif terhadap tanah.
+  - disp_x < 0 (-) : Gedung meliuk ke kiri relatif terhadap tanah.
+  - disp_x = 0     : Gedung tegak sempurna atau bergerak bersamaan dengan tanah
+                     tanpa mengalami deformasi geser.
+
+
+================================================================================
+4. RUMUS DISPLACEMENT SUMBU Z (RIGOROUS ARUCO 6-DoF POSE ESTIMATION - PnP)
+================================================================================
+KRITIK TERHADAP METODE RASIO UKURAN (SIZE RATIO BIAS):
+Pendekatan rasio ukuran 1D kontur (S_0 / S) mengasumsikan bidang marker selalu
+tegak lurus sempurna terhadap lensa kamera (fronto-parallel). Saat gempa terjadi,
+gedung mengalami simpangan lentur atau rotasi sudut (sway / tilt / rocking theta).
+Kemiringan sebesar theta menyebabkan efek perpendekan perspektif (foreshortening),
+di mana proyeksi luas marker menyusut sebanding dengan cos(theta).
+Metode rasio ukuran akan salah menafsirkan penyusutan ini sebagai pergerakan Z
+menjauh dari kamera (+delta Z palsu).
+
+SOLUSI RIGOROUS: ARUCO 6-DoF POSE ESTIMATION (PERSPECTIVE-n-POINT / PnP)
+--------------------------------------------------------------------------------
+Untuk memisahkan (decouple) murni antara rotasi gedung (tilt/sway) dengan
+translasi kedalaman (Z), sistem menggunakan formulasi Perspective-n-Point (PnP)
+pada 4 titik sudut planar marker ArUco.
+
+LANGKAH 1: Definisi Titik Objek 3D Dunia Marker (Object Points)
+--------------------------------------------------------------------------------
+Marker ArUco berbentuk bujur sangkar dengan panjang sisi fisik L (dalam mm).
+Keempat titik sudut didefinisikan pada koordinat lokal marker pada bidang Z_m = 0:
+
+  P_0 = [ -L/2,  +L/2,  0 ]^T   (Sudut kiri atas)
+  P_1 = [ +L/2,  +L/2,  0 ]^T   (Sudut kanan atas)
+  P_2 = [ +L/2,  -L/2,  0 ]^T   (Sudut kanan bawah)
+  P_3 = [ -L/2,  -L/2,  0 ]^T   (Sudut kiri bawah)
+
+LANGKAH 2: Matriks Intrinsik Kamera (Camera Matrix K) & Distorsi
+--------------------------------------------------------------------------------
+Proyeksi optik kamera dimodelkan dengan matriks pinhole:
+
+         [ f_x    0    c_x ]
+    K  = [  0    f_y   c_y ]
+         [  0     0     1  ]
+
+  di mana:
+    f_x, f_y = Panjang fokus efektif kamera dalam satuan piksel (px)
+    c_x, c_y = Titik pusat optik citra / principal point (px)
+               (umumnya mendekati width/2 dan height/2)
+    dist     = Vektor koefisien distorsi lensa [k1, k2, p1, p2, k3]
+
+LANGKAH 3: Penyelesaian Masalah PnP (cv2.solvePnP / IPPE Square)
+--------------------------------------------------------------------------------
+Untuk setiap titik sudut ke-j (j = 0, 1, 2, 3), titik 3D P_j diproyeksikan ke
+koordinat 2D piksel p_j = [u_j, v_j, 1]^T melalui persamaan transformasi:
+
+  s * p_j = K * ( R * P_j + t )
+
+  di mana:
+    s = Faktor skala proyeksi
+    R = Matriks rotasi 3x3 (SO(3)) yang merepresentasikan orientasi/kemiringan
+        gedung (Roll, Pitch, Yaw)
+    t = Vektor translasi 3x1 = [ t_x, t_y, t_z ]^T dalam sistem koordinat kamera (mm)
+
+Algoritma PnP (seperti Infinitesimal Plane-based Pose Estimation / IPPE Square)
+mengoptimalkan parameter R dan t dengan meminimalkan kesalahan reproyeksi:
+
+  arg min_{R, t} SUM_{j=0}^{3} || p_j - pi(K * (R * P_j + t)) ||^2
+
+KEUNGGULAN FISIS:
+Karena 4 titik sudut membentuk trapesium saat gedung miring, algoritma PnP
+mengatribusikan perubahan bentuk trapesium ke Matriks Rotasi R (kemiringan gedung),
+sehingga komponen t_z (posisi kedalaman sesungguhnya) TIDAK TERPENGARUH oleh
+kemiringan gedung.
+
+LANGKAH 4: Ekstraksi Kedalaman Absolut (Ground & Top)
+--------------------------------------------------------------------------------
+Dari solusi vektor translasi t masing-masing marker pada setiap frame:
+
+  G_z = t_z_ground   (Jarak absolut marker Ground ke kamera dalam mm)
+  T_z = t_z_top      (Jarak absolut marker Top ke kamera dalam mm)
+
+LANGKAH 5: Simpangan Relatif Z Terkoreksi Baseline (disp_z)
+--------------------------------------------------------------------------------
+Selisih jarak kedalaman relatif antar-marker:
+  rel_z = T_z - G_z   (mm)
+
+Pada kondisi awal diam, dihitung baseline kedalaman:
+  baseline_z = (1 / N) * SUM( rel_z_0 )   (mm)
+
+Maka simpangan dinamis murni sumbu Z:
+  disp_z = rel_z - baseline_z   (mm)
+
+LANGKAH 6: Filtering Derau Sensitivitas Z (Opsional)
+--------------------------------------------------------------------------------
+Derau kuantisasi piksel dapat diredam dengan rolling average window singkat
+atau low-pass filter (misal: window 7-15 frame):
+
+  disp_z_filtered = (1 / M) * SUM_{k=0}^{M-1} ( disp_z_{i-k} )   (mm)
+
+
+
+================================================================================
+5. RUMUS POSISI ABSOLUT NORMALISASI (GROUND & TOP)
+================================================================================
+Selain simpangan relatif (disp), sistem juga mencatat posisi absolut yang telah
+dinormalisasi mulai dari titik (0, 0):
+
+Posisi awal saat baseline selesai (origin):
+  origin_ground = (X_ground_0 * scale, Y_ground_0 * scale)
+  origin_top    = (X_top_0    * scale, Y_top_0    * scale)
+
+Posisi tiap frame di file CSV:
+  ground_x_mm = (X_ground * scale) - origin_ground_x
+  ground_y_mm = (Y_ground * scale) - origin_ground_y
+  top_x_mm    = (X_top    * scale) - origin_top_x
+  top_y_mm    = (Y_top    * scale) - origin_top_y
+
+
+================================================================================
+6. DAFTAR PARAMETER DI FILE CSV / EXCEL
+================================================================================
+1. timestamp_s   : Waktu perekaman sejak simulasi dimulai (detik)
+2. frame         : Indeks frame kamera (#)
+3. ground_x_mm   : Pergeseran horizontal meja getar dari titik awal (mm)
+4. ground_y_mm   : Pergeseran vertikal meja getar dari titik awal (mm)
+5. ground_z_mm   : Estimasi gerak maju/mundur meja getar (mm)
+6. top_x_mm      : Pergeseran horizontal puncak gedung dari titik awal (mm)
+7. top_y_mm      : Pergeseran vertikal puncak gedung dari titik awal (mm)
+8. top_z_mm      : Estimasi gerak maju/mundur puncak gedung (mm)
+9. disp_x_mm     : Simpangan relatif horizontal murni (Drift X) (mm)
+10. disp_y_mm    : Simpangan relatif vertikal murni (Lendutan Y) (mm)
+11. disp_z_mm    : Simpangan relatif kedalaman murni (Puntiran/Drift Z) (mm)
+12. status       : 'ok' (terdeteksi optik) atau 'interpolated' (prediksi Kalman)
+================================================================================
